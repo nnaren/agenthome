@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "permission_prompt|idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "osascript -e 'display notification \"Claude 需要你的输入或审批！\" with title \"Claude Code\" sound name \"Glass\"'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "osascript -e 'display notification \"任务已全部完成！\" with title \"Claude Code\" sound name \"Blow\"'; echo '__AGENTHOME_STOP__' >> .agenthome_hook_events"
+          }
+        ]
+      }
+    ]
+  }
+}

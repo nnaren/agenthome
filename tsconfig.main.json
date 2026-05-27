@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist/main",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "downlevelIteration": true
+  },
+  "include": ["src/main/**/*", "src/shared/**/*"]
+}
