@@ -1,5 +1,6 @@
 import type { CreateTaskInput, Task } from '../shared/types'
 import type { AcpFrontendEvent } from '../shared/acp'
+import type { ChatMessageRecord } from '../shared/chat'
 
 declare global {
   interface Window {
@@ -9,6 +10,8 @@ declare global {
       updateTaskStatus: (id: string, status: Task['status']) => Promise<{ id: string; status: string }>
       sendTaskInput: (taskId: string, data: string) => Promise<{ ok: boolean }>
       getTaskBuffer: (taskId: string) => Promise<string[]>
+      getChatHistory: (taskId: string) => Promise<ChatMessageRecord[]>
+      setChatHistory: (taskId: string, messages: ChatMessageRecord[]) => Promise<{ ok: boolean }>
       resizePty: (taskId: string, cols: number, rows: number) => Promise<void>
       killTask: (taskId: string) => Promise<void>
       onPtyData: (callback: (taskId: string, data: string) => void) => () => void
@@ -16,9 +19,12 @@ declare global {
       selectDirectory: () => Promise<string | null>
       openTaskCreateWindow: () => Promise<boolean>
       getTaskRuntimeMode: (taskId: string) => Promise<'legacy' | 'acp' | null>
-      acpSendAndStream: (taskId: string, prompt: string) => Promise<{ ok: boolean; sessionId?: string }>
+      acpSendAndStream: (taskId: string, prompt: string) => Promise<{ ok: boolean; sessionId?: string; busy?: boolean }>
       acpCancel: (sessionId: string) => Promise<{ ok: boolean }>
       acpRespondPermission: (sessionId: string, approved: boolean) => Promise<{ ok: boolean }>
+      acpCancelByTask: (taskId: string) => Promise<{ ok: boolean }>
+      getAcpTaskBusy: (taskId: string) => Promise<{ busy: boolean }>
+      getAcpSessionId: (taskId: string) => Promise<{ sessionId: string | null }>
       onAcpSessionUpdate: (callback: (event: AcpFrontendEvent) => void) => () => void
     }
   }

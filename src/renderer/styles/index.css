@@ -392,6 +392,52 @@ body {
   color: #fff;
 }
 
+.interaction-session-bar {
+  flex-shrink: 0;
+  padding: 8px 10px;
+  border-top: 1px solid #2a2a2a;
+  border-bottom: 1px solid #2a2a2a;
+  background: #1a1a1a;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.interaction-session-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.interaction-session-label {
+  flex-shrink: 0;
+  color: #888;
+  width: 52px;
+}
+
+.interaction-session-value {
+  color: #ccc;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.interaction-session-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: 11px;
+  color: #9ecfff;
+}
+
+.chat-assistant-body {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .chat-assistant-text {
   width: 100%;
   color: #dcdcdc;
@@ -399,7 +445,159 @@ body {
   word-break: break-word;
   font-size: 13px;
   line-height: 1.6;
-  padding: 2px 0;
+  padding: 0;
+  margin: 0;
+}
+
+.chat-code-block {
+  margin: 0;
+  padding: 10px 12px;
+  background: #161616;
+  border: 1px solid #2e2e2e;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+  color: #e2e2e2;
+  tab-size: 4;
+}
+
+.chat-code-block code {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+.chat-code-block-streaming {
+  border-color: #3a3a3a;
+}
+
+.chat-assistant-block {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.acp-permission-banner {
+  margin: 8px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid #4a5568;
+  border-radius: 8px;
+  background: #1e2a3a;
+}
+
+.acp-permission-message {
+  color: #e8d44d;
+  font-size: 13px;
+  line-height: 1.5;
+  margin-bottom: 10px;
+  word-break: break-word;
+}
+
+.acp-permission-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.acp-permission-approve {
+  background: #2f855a;
+}
+
+.acp-permission-deny {
+  background: #c53030;
+}
+
+.thought-fold {
+  width: 100%;
+  border-bottom: 1px solid #2a2a2a;
+  padding-bottom: 4px;
+  margin-bottom: 0;
+}
+
+.thought-fold-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #9a9a9a;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  user-select: none;
+}
+
+.thought-fold-trigger:hover {
+  color: #b8b8b8;
+}
+
+.thought-fold-chevron {
+  display: inline-block;
+  font-size: 14px;
+  line-height: 1;
+  transform: rotate(0deg);
+  transition: transform 0.15s ease;
+}
+
+.thought-fold-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.thought-fold-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+.thought-fold-body {
+  margin-top: 6px;
+  padding-left: 14px;
+  color: #8a8a8a;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.chat-tool-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+}
+
+.tool-fold {
+  border-bottom: 1px solid #2a2a2a;
+  padding-bottom: 4px;
+}
+
+.tool-fold-in_progress .thought-fold-label {
+  color: #a8c4f0;
+}
+
+.tool-fold-failed .thought-fold-label {
+  color: #d0a0a0;
+}
+
+.tool-fold-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tool-fold-cmd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  color: #9a9a9a;
+}
+
+.tool-fold-result {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
 }
 
 .interaction-system-log-wrap {
@@ -431,6 +629,14 @@ body {
   color: #b5b5b5;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.interaction-chunk-log-line {
+  color: #9cdc9c;
+}
+
+.interaction-tool-log-line {
+  color: #e0b080;
 }
 
 .interaction-log {

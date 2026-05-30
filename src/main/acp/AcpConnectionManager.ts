@@ -1,99 +1,85 @@
+import { Readable, Writable } from 'node:stream'
+import {
+  ClientSideConnection,
+  ndJsonStream,
+  PROTOCOL_VERSION
+} from '@agentclientprotocol/sdk'
 import { AcpAgentManager } from './AcpAgentManager'
-import { ndJsonStream } from './ndJsonStream'
-
-interface AcpProtocolMessage {
-  type: string
-  [key: string]: unknown
-}
+import { AcpClientBridge } from './AcpClientBridge'
 
 export class AcpConnectionManager {
-  private connected = false
-  private writer: WritableStreamDefaultWriter<AcpProtocolMessage> | null = null
-  private readonly listeners = new Set<(msg: AcpProtocolMessage) => void>()
-  private msgId = 0
+  private connection: ClientSideConnection | null = null
+  private initPromise: Promise<void> | null = null
+  private onAgentStderr: ((message: string) => void) | null = null
+  constructor(
+    private readonly agentManager: AcpAgentManager,
+    private readonly clientBridge: AcpClientBridge
+  ) {}
 
-  constructor(private readonly agentManager: AcpAgentManager) {}
+  setAgentStderrHandler(handler: (message: string) => void): void {
+    this.onAgentStderr = handler
+  }
+
+  setOnAgentExit(handler: () => void): void {
+    this.agentManager.setOnExit(handler)
+  }
+
+  reset(): void {
+    this.connection = null
+    this.initPromise = null
+  }
 
   async initialize(): Promise<void> {
-    if (this.connected) return
-    await this.agentManager.startIfNeeded()
-    const child = this.agentManager.getChildProcess()
-    if (child) {
-      child.stderr.on('data', (chunk: Buffer | string) => {
-        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8')
-        this.listeners.forEach((listener) => listener({
-          type: 'agentStderr',
-          message: text
-        }))
-      })
-      child.on('exit', (code, signal) => {
-        this.listeners.forEach((listener) => listener({
-          type: 'agentExit',
-          exitCode: code ?? null,
-          signal: signal ?? null
-        }))
-      })
-
-      const stdinStream = this.createWritableStream(child.stdin)
-      const stdoutStream = this.createReadableStream(child.stdout)
-      const codec = ndJsonStream<AcpProtocolMessage, AcpProtocolMessage>()
-
-      void stdoutStream.pipeThrough(codec.decode).pipeTo(new WritableStream<AcpProtocolMessage>({
-        write: (msg) => {
-          this.listeners.forEach((listener) => listener(msg))
-        }
-      }))
-      this.writer = codec.encode.writable.getWriter()
-      void codec.encode.readable.pipeTo(stdinStream)
-    }
-    this.connected = true
+    if (this.connection && this.agentManager.isChildAlive()) return
+    if (this.initPromise && this.agentManager.isChildAlive()) return this.initPromise
+    this.reset()
+    this.initPromise = this.doInitialize()
+    return this.initPromise
   }
 
   isConnected(): boolean {
-    return this.connected
+    return this.connection !== null && this.agentManager.isChildAlive()
   }
 
-  onMessage(handler: (msg: AcpProtocolMessage) => void): () => void {
-    this.listeners.add(handler)
-    return () => this.listeners.delete(handler)
-  }
-
-  async send(msg: AcpProtocolMessage): Promise<void> {
-    if (!this.writer) throw new Error('ACP NDJSON writer is not ready')
-    await this.writer.write(msg)
-  }
-
-  nextId(): string {
-    this.msgId += 1
-    return `acp-${Date.now()}-${this.msgId}`
+  getConnection(): ClientSideConnection {
+    if (!this.connection || !this.agentManager.isChildAlive()) {
+      throw new Error('ACP connection is not ready')
+    }
+    return this.connection
   }
 
   getAgentCommand(): string {
     return this.agentManager.getCommand()
   }
 
-  private createReadableStream(nodeReadable: NodeJS.ReadableStream): ReadableStream<Uint8Array> {
-    return new ReadableStream<Uint8Array>({
-      start(controller) {
-        nodeReadable.on('data', (chunk: Buffer | string) => {
-          const value = typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk)
-          controller.enqueue(value)
-        })
-        nodeReadable.on('end', () => controller.close())
-        nodeReadable.on('error', (error) => controller.error(error))
-      }
-    })
-  }
+  private async doInitialize(): Promise<void> {
+    await this.agentManager.startIfNeeded()
+    const child = this.agentManager.getChildProcess()
+    if (!child) throw new Error('ACP agent process not started')
 
-  private createWritableStream(nodeWritable: NodeJS.WritableStream): WritableStream<Uint8Array> {
-    return new WritableStream<Uint8Array>({
-      write(chunk) {
-        return new Promise<void>((resolve, reject) => {
-          nodeWritable.write(Buffer.from(chunk), (error) => {
-            if (error) reject(error)
-            else resolve()
-          })
-        })
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8')
+      const trimmed = text.trim()
+      if (!trimmed || !this.onAgentStderr) return
+      this.onAgentStderr(trimmed)
+    })
+
+    const input = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>
+    const output = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>
+    const stream = ndJsonStream(input, output)
+    this.connection = new ClientSideConnection(() => this.clientBridge, stream)
+
+    await this.connection.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {
+        fs: {
+          readTextFile: true,
+          writeTextFile: true
+        }
+      },
+      clientInfo: {
+        name: 'AgentHome',
+        version: '0.1.0'
       }
     })
   }

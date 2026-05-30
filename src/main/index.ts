@@ -3,10 +3,10 @@ import { join } from 'path'
 import * as pty from 'node-pty'
 import log from 'electron-log'
 import { mkdir, readFile, writeFile } from 'fs/promises'
+import type { ChatMessageRecord } from '../shared/chat'
 import type { CreateTaskInput, Task } from '../shared/types'
-import { AcpAgentManager } from './acp/AcpAgentManager'
-import { AcpConnectionManager } from './acp/AcpConnectionManager'
-import { AcpSessionManager } from './acp/AcpSessionManager'
+import { AcpRuntimeRegistry } from './acp/AcpRuntimeRegistry'
+import { AcpTaskBusyError } from './acp/AcpTaskRuntime'
 
 log.info('AgentHome starting...')
 
@@ -17,6 +17,7 @@ const tasks: Task[] = []
 const ptyMap = new Map<string, pty.IPty>()
 const acpSessionIdByTask = new Map<string, string>()
 const interactionBuffers = new Map<string, string[]>()
+const chatHistories = new Map<string, ChatMessageRecord[]>()
 const stopWatchers = new Map<string, NodeJS.Timeout>()
 const hookEventOffsets = new Map<string, number>()
 
@@ -28,9 +29,9 @@ const AGENT_COMMAND_MAP: Record<string, string> = {
 
 const ACP_ENABLE = process.env.AGENTHOME_ENABLE_ACP === '1'
 const ACP_ENDPOINT = process.env.AGENTHOME_ACP_ENDPOINT ?? ''
-const acpAgentManager = new AcpAgentManager()
-const acpConnectionManager = new AcpConnectionManager(acpAgentManager)
-const acpSessionManager = ACP_ENABLE ? new AcpSessionManager(acpConnectionManager) : null
+/** 默认自动批准 ACP 工具权限；设 AGENTHOME_ACP_AUTO_APPROVE=0 改为 UI 手动确认 */
+const ACP_AUTO_APPROVE_PERMISSION = process.env.AGENTHOME_ACP_AUTO_APPROVE !== '0'
+let acpRegistry: AcpRuntimeRegistry | null = null
 
 function getAcpUnavailableReason(agent: string): string {
   if (agent !== 'claude-code') return '当前任务类型不是 claude-code，默认使用终端模式'
@@ -153,38 +154,64 @@ function appendInteraction(taskId: string, text: string): void {
   lines.push(text)
   if (lines.length > 1000) lines.splice(0, lines.length - 1000)
   interactionBuffers.set(taskId, lines)
+  const target = tasks.find(t => t.id === taskId)
+  if (target?.runtimeMode === 'acp') return
   mainWindow?.webContents.send('pty-data', taskId, text)
 }
 
-if (acpSessionManager) {
-  acpSessionManager.onEvent((event) => {
-    mainWindow?.webContents.send('acp-session-update', event)
-    const target = tasks.find(t => t.id === event.taskId)
-    if (!target) return
-    if (event.type === 'sessionUpdate') {
-      target.status = 'running'
-      appendInteraction(event.taskId, event.chunk ?? '')
-      return
-    }
-    if (event.type === 'permissionRequest') {
-      target.status = 'waiting_input'
-      appendInteraction(event.taskId, '[system] ACP permission/input requested, status -> 等待输入\n')
-      return
-    }
-    if (event.type === 'sessionDone') {
-      target.status = (event.exitCode ?? 0) === 0 ? 'completed' : 'interrupted'
-      target.exitCode = event.exitCode ?? null
-      target.finishedAt = Date.now()
-      appendInteraction(event.taskId, `[system] ACP session done: ${event.exitCode ?? -1}\n`)
-      return
-    }
-    if (event.type === 'sessionError') {
-      target.lastError = event.message ?? 'ACP session error'
-      target.status = 'interrupted'
-      target.finishedAt = Date.now()
-      appendInteraction(event.taskId, `[system] ACP session error: ${event.message ?? 'unknown'}\n`)
-    }
-  })
+function ensureAcpRegistry(): AcpRuntimeRegistry | null {
+  if (!ACP_ENABLE) return null
+  if (!acpRegistry) {
+    acpRegistry = new AcpRuntimeRegistry((event) => {
+      mainWindow?.webContents.send('acp-session-update', event)
+      const target = tasks.find(t => t.id === event.taskId)
+      if (!target) return
+      if (event.type === 'sessionUpdate') {
+        target.status = 'running'
+        if (event.chunkKind !== 'thought') {
+          appendInteraction(event.taskId, event.chunk ?? '')
+        }
+        return
+      }
+      if (event.type === 'toolCall' || event.type === 'toolCallUpdate') {
+        target.status = 'running'
+        return
+      }
+      if (event.type === 'permissionRequest') {
+        target.status = 'waiting_input'
+        appendInteraction(
+          event.taskId,
+          `[system] ACP permission/input requested: ${event.message ?? 'permission required'}\n`
+        )
+        if (ACP_AUTO_APPROVE_PERMISSION) {
+          acpRegistry?.getBySessionId(event.sessionId)?.respondPermission(true)
+          appendInteraction(event.taskId, '[system] ACP permission auto-approved\n')
+          target.status = 'running'
+        }
+        return
+      }
+      if (event.type === 'sessionDone') {
+        const code = event.exitCode ?? 0
+        const cancelled = code === 130
+        target.status = code === 0 || cancelled ? 'waiting_input' : 'interrupted'
+        target.exitCode = event.exitCode ?? null
+        if (code !== 0 && !cancelled) target.finishedAt = Date.now()
+        appendInteraction(
+          event.taskId,
+          cancelled
+            ? '[system] ACP turn cancelled (Esc), session kept, status -> 等待输入\n'
+            : '[system] ACP turn done, status -> 等待输入\n'
+        )
+        return
+      }
+      if (event.type === 'sessionError') {
+        target.lastError = event.message ?? 'ACP session error'
+        target.status = 'waiting_input'
+        appendInteraction(event.taskId, `[system] ACP session error: ${event.message ?? 'unknown'}\n`)
+      }
+    })
+  }
+  return acpRegistry
 }
 
 function startStopWatcher(taskId: string, cwd: string): void {
@@ -228,9 +255,9 @@ function stopTaskExecution(task: Task, reason: string): void {
     try { p.kill() } catch {}
     ptyMap.delete(task.id)
   }
-  const sessionId = acpSessionIdByTask.get(task.id)
-  if (sessionId && acpSessionManager) {
-    void acpSessionManager.cancel(sessionId).catch(() => {})
+  const registry = ensureAcpRegistry()
+  if (registry) {
+    void registry.dispose(task.id).catch(() => {})
     acpSessionIdByTask.delete(task.id)
   }
   stopStopWatcher(task.id)
@@ -238,16 +265,15 @@ function stopTaskExecution(task: Task, reason: string): void {
 }
 
 async function tryStartAcpSession(task: Task, cwd: string): Promise<boolean> {
-  if (!acpSessionManager) return false
+  const registry = ensureAcpRegistry()
+  if (!registry) return false
   try {
-    const baseCommand = AGENT_COMMAND_MAP[task.agent] ?? task.command
     const initialPrompt = task.description?.trim()
-    const { sessionId } = await acpSessionManager.sendAndStream({
-      taskId: task.id,
-      command: baseCommand,
+    const runtime = registry.getOrCreate(task.id)
+    const { sessionId } = await runtime.sendPrompt(
       cwd,
-      prompt: initialPrompt || '请先进行任务分析并给出第一步执行建议。'
-    })
+      initialPrompt || '请先进行任务分析并给出第一步执行建议。'
+    )
     acpSessionIdByTask.set(task.id, sessionId)
     task.runtimeMode = 'acp'
     task.lastError = undefined
@@ -264,8 +290,20 @@ async function tryStartAcpSession(task: Task, cwd: string): Promise<boolean> {
   }
 }
 
+function seedChatUserMessage(task: Task): void {
+  const desc = task.description?.trim()
+  if (!desc) return
+  const existing = chatHistories.get(task.id) ?? []
+  if (existing.some((m) => m.role === 'user')) return
+  chatHistories.set(task.id, [
+    { id: `user-init-${task.id}`, role: 'user', content: desc },
+    ...existing
+  ])
+}
+
 async function startTaskExecution(task: Task): Promise<void> {
   if (task.status === 'running' || task.status === 'waiting_input') return
+  seedChatUserMessage(task)
   const cwd = task.workPath || process.cwd()
   task.startedAt = Date.now()
   task.finishedAt = undefined
@@ -356,10 +394,8 @@ app.on('window-all-closed', () => {
     try { p.kill() } catch {}
   })
   ptyMap.clear()
-  if (acpSessionManager) {
-    acpSessionIdByTask.forEach((sessionId) => {
-      void acpSessionManager.cancel(sessionId).catch(() => {})
-    })
+  if (acpRegistry) {
+    void acpRegistry.disposeAll().catch(() => {})
   }
   acpSessionIdByTask.clear()
   if (process.platform !== 'darwin') app.quit()
@@ -377,6 +413,13 @@ ipcMain.handle('create-task', async (_, input: CreateTaskInput) => createTask(in
 
 ipcMain.handle('task-get-buffer', (_, taskId: string) => interactionBuffers.get(taskId) ?? [])
 
+ipcMain.handle('get-chat-history', (_, taskId: string) => chatHistories.get(taskId) ?? [])
+
+ipcMain.handle('set-chat-history', (_, taskId: string, messages: ChatMessageRecord[]) => {
+  chatHistories.set(taskId, messages)
+  return { ok: true }
+})
+
 ipcMain.handle('task-send-input', (_, taskId: string, data: string) => {
   const p = ptyMap.get(taskId)
   const acpSessionId = acpSessionIdByTask.get(taskId)
@@ -386,12 +429,11 @@ ipcMain.handle('task-send-input', (_, taskId: string, data: string) => {
     target.status = 'running'
     appendInteraction(taskId, '[system] user input received, status -> 运行中\n')
   }
-  if (acpSessionId && acpSessionManager && target && data.trim()) {
-    void acpSessionManager.sendAndStream({
-      taskId,
-      command: AGENT_COMMAND_MAP[target.agent] ?? target.command,
-      cwd: target.workPath || process.cwd(),
-      prompt: data.trim()
+  const registry = ensureAcpRegistry()
+  if (registry && target?.runtimeMode === 'acp' && data.trim()) {
+    const runtime = registry.getOrCreate(taskId)
+    void runtime.sendPrompt(target.workPath || process.cwd(), data.trim()).then(({ sessionId }) => {
+      acpSessionIdByTask.set(taskId, sessionId)
     }).catch((error) => {
       const message = error instanceof Error ? error.message : 'send input failed'
       appendInteraction(taskId, `[system] ACP send input failed: ${message}\n`)
@@ -411,9 +453,9 @@ ipcMain.handle('resize-pty', (_, taskId: string, cols: number, rows: number) => 
 ipcMain.handle('kill-task', (_, taskId: string) => {
   const p = ptyMap.get(taskId)
   if (p) { p.kill(); ptyMap.delete(taskId) }
-  const sessionId = acpSessionIdByTask.get(taskId)
-  if (sessionId && acpSessionManager) {
-    void acpSessionManager.cancel(sessionId).catch(() => {})
+  const registry = ensureAcpRegistry()
+  if (registry) {
+    void registry.dispose(taskId).catch(() => {})
     acpSessionIdByTask.delete(taskId)
   }
   stopStopWatcher(taskId)
@@ -421,11 +463,11 @@ ipcMain.handle('kill-task', (_, taskId: string) => {
   if (target) { target.status = 'interrupted'; target.finishedAt = Date.now() }
 })
 
-ipcMain.handle('update-task-status', (_, id, status) => {
+ipcMain.handle('update-task-status', async (_, id, status) => {
   const target = tasks.find(t => t.id === id)
   if (target) {
     if (status === 'running') {
-      void startTaskExecution(target)
+      await startTaskExecution(target)
     } else {
       if (status === 'completed') {
         if (target.runtimeMode === 'acp') {
@@ -460,25 +502,49 @@ ipcMain.handle('update-task-status', (_, id, status) => {
 ipcMain.handle('get-project-path', () => process.cwd())
 ipcMain.handle('acp-send-and-stream', async (_, taskId: string, prompt: string) => {
   const target = tasks.find(t => t.id === taskId)
-  if (!target || !acpSessionManager) return { ok: false }
-  const { sessionId } = await acpSessionManager.sendAndStream({
-    taskId,
-    command: AGENT_COMMAND_MAP[target.agent] ?? target.command,
-    cwd: target.workPath || process.cwd(),
-    prompt
-  })
-  acpSessionIdByTask.set(taskId, sessionId)
-  return { ok: true, sessionId }
+  const registry = ensureAcpRegistry()
+  if (!target || !registry) return { ok: false }
+  try {
+    const runtime = registry.getOrCreate(taskId)
+    const { sessionId } = await runtime.sendPrompt(target.workPath || process.cwd(), prompt)
+    acpSessionIdByTask.set(taskId, sessionId)
+    return { ok: true, sessionId }
+  } catch (error) {
+    if (error instanceof AcpTaskBusyError) {
+      return { ok: false, busy: true }
+    }
+    throw error
+  }
 })
 ipcMain.handle('acp-cancel', async (_, sessionId: string) => {
-  if (!acpSessionManager) return { ok: false }
-  await acpSessionManager.cancel(sessionId)
+  const registry = ensureAcpRegistry()
+  if (!registry) return { ok: false }
+  const runtime = registry.getBySessionId(sessionId)
+  if (runtime) await runtime.cancelCurrentTurn()
+  return { ok: true }
+})
+ipcMain.handle('acp-cancel-by-task', async (_, taskId: string) => {
+  const registry = ensureAcpRegistry()
+  if (!registry) return { ok: false }
+  await registry.cancelCurrentTurn(taskId)
   return { ok: true }
 })
 ipcMain.handle('acp-respond-permission', async (_, sessionId: string, approved: boolean) => {
-  if (!acpSessionManager) return { ok: false }
-  await acpSessionManager.respondPermission(sessionId, approved)
+  const registry = ensureAcpRegistry()
+  if (!registry) return { ok: false }
+  registry.getBySessionId(sessionId)?.respondPermission(approved)
   return { ok: true }
+})
+ipcMain.handle('get-acp-task-busy', (_, taskId: string) => {
+  const registry = ensureAcpRegistry()
+  return { busy: registry?.isBusy(taskId) ?? false }
+})
+ipcMain.handle('get-acp-session-id', (_, taskId: string) => {
+  const fromMap = acpSessionIdByTask.get(taskId) ?? null
+  if (fromMap) return { sessionId: fromMap }
+  const registry = ensureAcpRegistry()
+  const runtimeId = registry?.get(taskId)?.getSessionId() ?? null
+  return { sessionId: runtimeId }
 })
 ipcMain.handle('get-task-runtime-mode', (_, taskId: string) => {
   const target = tasks.find(t => t.id === taskId)

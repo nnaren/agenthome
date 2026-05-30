@@ -48,7 +48,7 @@ function App() {
   const handleStatusChange = async (id: string, status: Task['status']) => {
     try {
       await window.electronAPI.updateTaskStatus(id, status)
-      setTasks(prev => prev.map(t => t.id === id ? { ...t, status } : t))
+      await loadTasks()
     } catch (e) {
       console.error('Failed to update task:', e)
     }
