@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { CreateTaskInput, Task } from '../shared/types'
+import type { AcpFrontendEvent } from '../shared/acp'
 
 export interface ElectronAPI {
   getTasks: () => Promise<Task[]>
@@ -13,6 +14,11 @@ export interface ElectronAPI {
   getProjectPath: () => Promise<string>
   selectDirectory: () => Promise<string | null>
   openTaskCreateWindow: () => Promise<boolean>
+  getTaskRuntimeMode: (taskId: string) => Promise<'legacy' | 'acp' | null>
+  acpSendAndStream: (taskId: string, prompt: string) => Promise<{ ok: boolean; sessionId?: string }>
+  acpCancel: (sessionId: string) => Promise<{ ok: boolean }>
+  acpRespondPermission: (sessionId: string, approved: boolean) => Promise<{ ok: boolean }>
+  onAcpSessionUpdate: (callback: (event: AcpFrontendEvent) => void) => () => void
 }
 
 const api: ElectronAPI = {
@@ -30,7 +36,16 @@ const api: ElectronAPI = {
   },
   getProjectPath: () => ipcRenderer.invoke('get-project-path'),
   selectDirectory: () => ipcRenderer.invoke('select-directory'),
-  openTaskCreateWindow: () => ipcRenderer.invoke('open-task-create-window')
+  openTaskCreateWindow: () => ipcRenderer.invoke('open-task-create-window'),
+  getTaskRuntimeMode: (taskId) => ipcRenderer.invoke('get-task-runtime-mode', taskId),
+  acpSendAndStream: (taskId, prompt) => ipcRenderer.invoke('acp-send-and-stream', taskId, prompt),
+  acpCancel: (sessionId) => ipcRenderer.invoke('acp-cancel', sessionId),
+  acpRespondPermission: (sessionId, approved) => ipcRenderer.invoke('acp-respond-permission', sessionId, approved),
+  onAcpSessionUpdate: (callback) => {
+    const handler = (_: Electron.IpcRendererEvent, event: AcpFrontendEvent) => callback(event)
+    ipcRenderer.on('acp-session-update', handler)
+    return () => ipcRenderer.removeListener('acp-session-update', handler)
+  }
 }
 
 contextBridge.exposeInMainWorld('electronAPI', api)

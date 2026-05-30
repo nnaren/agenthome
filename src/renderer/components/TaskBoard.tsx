@@ -2,7 +2,7 @@ import type { Task, Column } from '../../shared/types'
 import TaskCard from './TaskCard'
 
 const COLUMNS: Column[] = [
-  { id: 'created', title: '创建任务', color: '#6c757d' },
+  { id: 'created', title: '新建任务（待启动）', color: '#6c757d' },
   { id: 'running', title: '运行中任务', color: '#0d6efd' },
   { id: 'completed', title: '完成任务', color: '#198754' },
   { id: 'interrupted', title: '中断的任务', color: '#dc3545' }
@@ -31,12 +31,23 @@ function TaskBoard({ tasks, onStatusChange, selectedTaskId, onSelectTask }: Task
             <span className="column-title">{col.title}</span>
             <span className="column-count">{getTasksByStatus(col.id).length}</span>
           </div>
-          <div className="column-body">
+          <div
+            className="column-body"
+            onDragOver={(e) => {
+              e.preventDefault()
+              e.dataTransfer.dropEffect = 'move'
+            }}
+            onDrop={(e) => {
+              e.preventDefault()
+              const taskId = e.dataTransfer.getData('text/task-id')
+              if (!taskId) return
+              onStatusChange(taskId, col.id)
+            }}
+          >
             {getTasksByStatus(col.id).map(task => (
               <TaskCard
                 key={task.id}
                 task={task}
-                onStatusChange={onStatusChange}
                 onSelect={onSelectTask}
                 selected={task.id === selectedTaskId}
               />

@@ -66,10 +66,10 @@ function TaskCreateWindow() {
           onChange={e => setWorkPath(e.target.value)}
         />
         <button className="btn-secondary" onClick={handlePickPath}>本地选择路径</button>
-        <div className="form-hint">会启动集成终端会话，并执行所选 Agent 对应命令</div>
+        <div className="form-hint">创建后进入待启动列，可拖拽到运行中启动任务</div>
         <div className="task-form-actions">
           <button className="btn-secondary" onClick={() => window.close()}>取消</button>
-          <button className="btn-primary" onClick={handleSubmit}>创建并启动集成终端</button>
+          <button className="btn-primary" onClick={handleSubmit}>创建任务</button>
         </div>
       </div>
     </div>

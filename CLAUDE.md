@@ -1,60 +1,109 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文档是 Claude Code 在本仓库中的工作指南。
 
-## Project Overview
+## 项目概览
 
-AgentHome is an Electron desktop application for managing and orchestrating multiple AI agent tasks. It provides a 4-column Kanban board (创建任务/运行中/完成任务/中断的任务) for visualizing task states, with real-time terminal output via xterm.js and interaction capabilities.
+AgentHome 是一个基于 Electron 的多 Agent 任务编排桌面应用，包含：
+- 四列看板：`created` / `running` / `completed` / `interrupted`
+- 基于 xterm.js 的实时终端输出
+- 任务交互面板（可继续输入）
 
-## Commands
+运行时注意：当前主进程逻辑中，任务创建后会直接进入 `running`。`created` 状态目前更多是类型与看板列定义保留，不是默认入口状态。
+
+## 常用命令
 
 ```bash
-npm run dev          # Start development server with hot reload
-npm run build       # Build for production
-npm run package     # Build and package for current platform
-npm run package:win # Build and package for Windows
-npm run package:linux # Build and package for Linux
-npm run lint        # Run ESLint
+npm run dev            # Electron + Renderer 热更新开发
+npm run build          # 生产构建
+npm run package        # 构建并打包当前平台
+npm run package:win    # 构建并打包 Windows
+npm run package:linux  # 构建并打包 Linux
+npm run lint           # 对 src 运行 ESLint
 ```
 
-## Architecture
+## 架构说明
 
-### Multi-Process Structure
+### 多进程结构
 
-- **Main Process** (`src/main/index.ts`): Electron main process managing terminal tasks via `node-pty`. Handles IPC handlers for task CRUD, PTY spawning, and window management.
-- **Preload** (`src/preload/index.ts`): Exposes a typed `electronAPI` interface via `contextBridge` for secure renderer-to-main communication.
-- **Renderer** (`src/renderer/`): React UI with components for the task board, cards, and interaction panel.
-- **Shared** (`src/shared/types.ts`): Common TypeScript types for Task, TaskStatus, and Column definitions.
+- **Main 进程**（`src/main/index.ts`）
+  - 任务编排与 PTY 生命周期管理（`node-pty`）
+  - Claude stop hook 事件监听/轮询
+  - IPC 与窗口管理
+- **Preload**（`src/preload/index.ts`）
+  - 通过 `contextBridge` 暴露类型化 `electronAPI`
+- **Renderer**（`src/renderer/`）
+  - React UI：工具栏、看板、任务卡片、交互面板、任务创建窗口
+- **Shared**（`src/shared/types.ts`）
+  - 公共类型：`Task`、`TaskStatus`、`AgentType` 等
 
-### IPC Communication
+### 当前 IPC 通道
 
-The renderer communicates with main via these channels:
-- `get-tasks`, `create-task`, `update-task-status` - Task management
-- `task-send-input`, `task-get-buffer`, `resize-pty` - Terminal interaction
-- `open-task-create-window` - Secondary window management
+任务与查询：
+- `get-tasks`
+- `create-task`
+- `update-task-status`
+- `kill-task`
 
-### Task Lifecycle
+终端交互：
+- `task-get-buffer`
+- `task-send-input`
+- `resize-pty`
 
-Tasks transition through statuses: `created` → `running` → `completed`/`interrupted`. The `waiting_input` status is used when Claude prompts for user approval - the main process monitors `.agenthome_hook_events` files to detect stop hooks and pause tasks.
+项目与窗口：
+- `get-project-path`
+- `select-directory`
+- `open-task-create-window`
 
-### Claude Code Integration
+## 任务生命周期（实际行为）
 
-When `agent: 'claude-code'` is specified, the main process automatically:
-1. Writes Claude hooks configuration to `.claude/settings.json` and `.claude/settings.local.json`
-2. Monitors hook events file for `__AGENTHOME_STOP__` markers to detect permission prompts
-3. Uses macOS `osascript` notifications for permission prompts
+以 `src/main/index.ts` 当前实现为准：
+1. `create-task` 创建任务时直接设为 `running`，并立即启动 PTY。
+2. 检测到 `__AGENTHOME_STOP__` 后，任务切到 `waiting_input`。
+3. 用户对 `waiting_input` 任务发送输入后，状态恢复为 `running`。
+4. PTY 退出后，任务状态设为 `completed`，并记录 `exitCode`。
+5. 手动 kill 后，任务状态设为 `interrupted`。
 
-### Agent Types
+UI 说明：从使用视角看，`waiting_input` 通常与运行态任务一起展示/处理。
 
-Supported agents are mapped to CLI commands:
-- `claude-code` → `claude`
-- `flow-cli` → `flow`
-- `hermes-agent` → `hermes`
+## Claude Code 集成
 
-## Key Files
+当 `agent: 'claude-code'` 时：
+1. 主进程会写入 hooks 配置到：
+   - `.claude/settings.json`
+   - `.claude/settings.local.json`
+2. Stop hook 会向 `.agenthome_hook_events` 写入标记。
+3. 主进程轮询该事件文件，检测到标记后将任务置为 `waiting_input`。
+4. 使用 `osascript` 发送 macOS 通知。
 
-- `src/main/index.ts`: Main process entry with PTY management and IPC handlers
-- `src/renderer/App.tsx`: Root React component with layout (Toolbar, TaskBoard, InteractionPanel)
-- `src/renderer/components/TaskBoard.tsx`: 4-column Kanban board rendering
-- `src/preload/index.ts`: Preload script exposing typed electronAPI
-- `electron.vite.config.ts`: Build configuration for main/preload/renderer builds
+使用注意：
+- Claude 任务启动时会覆盖写入上述 hooks 配置文件。
+- 通知实现当前依赖 macOS；Linux/Windows 无等价实现。
+- 若 hook 事件文件未被写入，则不会自动切换到 `waiting_input`。
+
+## Agent 类型映射
+
+- `claude-code` -> `claude`
+- `flow-cli` -> `flow`
+- `hermes-agent` -> `hermes`
+
+本地环境需保证以上 CLI 在 PATH 中可执行。
+
+## 常见排障
+
+- `npm install` 卡在 Electron 二进制下载：
+  - 检查代理、镜像与 Electron 缓存目录。
+- 任务启动后秒退：
+  - 检查映射 CLI（`claude` / `flow` / `hermes`）是否可执行。
+- 任务未进入 `waiting_input`：
+  - 检查 `.agenthome_hook_events` 是否被创建并持续追加。
+
+## 关键文件
+
+- `src/main/index.ts`：PTY 管理、hook watcher、IPC 入口
+- `src/preload/index.ts`：安全桥接 API
+- `src/renderer/App.tsx`：主界面布局与任务刷新流
+- `src/renderer/components/TaskBoard.tsx`：看板分列与任务聚合
+- `src/renderer/components/TaskInteractionPanel.tsx`：xterm 交互
+- `src/shared/types.ts`：共享类型定义
+- `electron.vite.config.ts`：main/preload/renderer 构建配置

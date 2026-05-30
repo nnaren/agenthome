@@ -4,6 +4,9 @@ import * as pty from 'node-pty'
 import log from 'electron-log'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import type { CreateTaskInput, Task } from '../shared/types'
+import { AcpAgentManager } from './acp/AcpAgentManager'
+import { AcpConnectionManager } from './acp/AcpConnectionManager'
+import { AcpSessionManager } from './acp/AcpSessionManager'
 
 log.info('AgentHome starting...')
 
@@ -12,6 +15,7 @@ let taskCreateWindow: BrowserWindow | null = null
 
 const tasks: Task[] = []
 const ptyMap = new Map<string, pty.IPty>()
+const acpSessionIdByTask = new Map<string, string>()
 const interactionBuffers = new Map<string, string[]>()
 const stopWatchers = new Map<string, NodeJS.Timeout>()
 const hookEventOffsets = new Map<string, number>()
@@ -20,6 +24,28 @@ const AGENT_COMMAND_MAP: Record<string, string> = {
   'claude-code': 'claude',
   'flow-cli': 'flow',
   'hermes-agent': 'hermes'
+}
+
+const ACP_ENABLE = process.env.AGENTHOME_ENABLE_ACP === '1'
+const ACP_ENDPOINT = process.env.AGENTHOME_ACP_ENDPOINT ?? ''
+const acpAgentManager = new AcpAgentManager()
+const acpConnectionManager = new AcpConnectionManager(acpAgentManager)
+const acpSessionManager = ACP_ENABLE ? new AcpSessionManager(acpConnectionManager) : null
+
+function getAcpUnavailableReason(agent: string): string {
+  if (agent !== 'claude-code') return '当前任务类型不是 claude-code，默认使用终端模式'
+  if (!ACP_ENABLE) return '未开启 AGENTHOME_ENABLE_ACP=1，使用终端模式'
+  return 'ACP agent 协议不可用，已回退到终端模式'
+}
+
+function ensureTaskRuntimeReason(task: Task): void {
+  if (task.runtimeMode === 'acp') {
+    if (!task.runtimeReason) task.runtimeReason = '已连接 ACP 会话'
+    return
+  }
+  if (!task.runtimeMode) task.runtimeMode = 'legacy'
+  if (!task.runtimeReason) task.runtimeReason = getAcpUnavailableReason(task.agent)
+  if (!task.runtimeEndpoint) task.runtimeEndpoint = ACP_ENDPOINT || '(未配置)'
 }
 
 const CLAUDE_HOOKS_CONFIG = {
@@ -130,6 +156,37 @@ function appendInteraction(taskId: string, text: string): void {
   mainWindow?.webContents.send('pty-data', taskId, text)
 }
 
+if (acpSessionManager) {
+  acpSessionManager.onEvent((event) => {
+    mainWindow?.webContents.send('acp-session-update', event)
+    const target = tasks.find(t => t.id === event.taskId)
+    if (!target) return
+    if (event.type === 'sessionUpdate') {
+      target.status = 'running'
+      appendInteraction(event.taskId, event.chunk ?? '')
+      return
+    }
+    if (event.type === 'permissionRequest') {
+      target.status = 'waiting_input'
+      appendInteraction(event.taskId, '[system] ACP permission/input requested, status -> 等待输入\n')
+      return
+    }
+    if (event.type === 'sessionDone') {
+      target.status = (event.exitCode ?? 0) === 0 ? 'completed' : 'interrupted'
+      target.exitCode = event.exitCode ?? null
+      target.finishedAt = Date.now()
+      appendInteraction(event.taskId, `[system] ACP session done: ${event.exitCode ?? -1}\n`)
+      return
+    }
+    if (event.type === 'sessionError') {
+      target.lastError = event.message ?? 'ACP session error'
+      target.status = 'interrupted'
+      target.finishedAt = Date.now()
+      appendInteraction(event.taskId, `[system] ACP session error: ${event.message ?? 'unknown'}\n`)
+    }
+  })
+}
+
 function startStopWatcher(taskId: string, cwd: string): void {
   const hookFile = join(cwd, '.agenthome_hook_events')
   hookEventOffsets.set(taskId, 0)
@@ -165,38 +222,82 @@ function stopStopWatcher(taskId: string): void {
   hookEventOffsets.delete(taskId)
 }
 
-async function createTerminalTask(input: CreateTaskInput): Promise<Task> {
-  const baseCommand = AGENT_COMMAND_MAP[input.agent]
-  if (!baseCommand) throw new Error(`unknown agent: ${input.agent}`)
-
-  const cwd = input.workPath || process.cwd()
-  const computedName = input.name.trim() || `${input.agent} 任务`
-  const desc = input.description?.trim()
-  const fullCommand = desc ? `${baseCommand} ${shellSingleQuote(desc)}` : baseCommand
-
-  const task: Task = {
-    id: Date.now().toString(),
-    ...input,
-    name: computedName,
-    command: fullCommand,
-    interactions: [],
-    status: 'running',
-    createdAt: input.createdAt,
-    startedAt: Date.now()
+function stopTaskExecution(task: Task, reason: string): void {
+  const p = ptyMap.get(task.id)
+  if (p) {
+    try { p.kill() } catch {}
+    ptyMap.delete(task.id)
   }
-  tasks.push(task)
-  interactionBuffers.set(task.id, [])
-  if (input.agent === 'claude-code') {
+  const sessionId = acpSessionIdByTask.get(task.id)
+  if (sessionId && acpSessionManager) {
+    void acpSessionManager.cancel(sessionId).catch(() => {})
+    acpSessionIdByTask.delete(task.id)
+  }
+  stopStopWatcher(task.id)
+  appendInteraction(task.id, `[system] ${reason}\n`)
+}
+
+async function tryStartAcpSession(task: Task, cwd: string): Promise<boolean> {
+  if (!acpSessionManager) return false
+  try {
+    const baseCommand = AGENT_COMMAND_MAP[task.agent] ?? task.command
+    const initialPrompt = task.description?.trim()
+    const { sessionId } = await acpSessionManager.sendAndStream({
+      taskId: task.id,
+      command: baseCommand,
+      cwd,
+      prompt: initialPrompt || '请先进行任务分析并给出第一步执行建议。'
+    })
+    acpSessionIdByTask.set(task.id, sessionId)
+    task.runtimeMode = 'acp'
+    task.lastError = undefined
+    task.runtimeReason = '已连接 ACP 会话'
+    appendInteraction(task.id, '[system] ACP session started.\n')
+    return true
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'ACP start failed'
+    task.lastError = message
+    task.runtimeMode = 'legacy'
+    task.runtimeReason = `ACP 启动失败，已回退终端模式: ${message}`
+    appendInteraction(task.id, `[system] ACP unavailable, fallback to legacy: ${message}\n`)
+    return false
+  }
+}
+
+async function startTaskExecution(task: Task): Promise<void> {
+  if (task.status === 'running' || task.status === 'waiting_input') return
+  const cwd = task.workPath || process.cwd()
+  task.startedAt = Date.now()
+  task.finishedAt = undefined
+  task.exitCode = undefined
+  task.lastError = undefined
+  task.status = 'running'
+  task.runtimeMode = 'legacy'
+  task.runtimeReason = getAcpUnavailableReason(task.agent)
+  task.runtimeEndpoint = ACP_ENDPOINT || '(未配置)'
+
+  if (task.agent === 'claude-code') {
+    const acpReady = await tryStartAcpSession(task, cwd)
+    if (!acpReady) {
+      task.runtimeMode = 'legacy'
+      if (!task.runtimeReason) task.runtimeReason = getAcpUnavailableReason(task.agent)
+    }
+  }
+  if (task.agent === 'claude-code' && task.runtimeMode !== 'acp') {
     await ensureClaudeHooks(cwd)
     appendInteraction(task.id, `[system] hooks written: ${join(cwd, '.claude', 'settings.json')}\n`)
     appendInteraction(task.id, `[system] hooks written: ${join(cwd, '.claude', 'settings.local.json')}\n`)
     startStopWatcher(task.id, cwd)
   }
-  appendInteraction(task.id, `[system] terminal started: ${fullCommand}\n`)
+  if (task.runtimeMode === 'acp') {
+    appendInteraction(task.id, `[system] ACP mode started: ${task.command}\n`)
+    appendInteraction(task.id, `[system] cwd: ${cwd}\n`)
+    return
+  }
+  appendInteraction(task.id, `[system] terminal started: ${task.command}\n`)
   appendInteraction(task.id, `[system] cwd: ${cwd}\n`)
-
   const shell = process.platform === 'win32' ? 'powershell.exe' : 'zsh'
-  const ptyProcess = pty.spawn(shell, ['-c', fullCommand], {
+  const ptyProcess = pty.spawn(shell, ['-c', task.command], {
     cwd,
     env: { ...process.env, TERM: 'xterm-256color' } as { [key: string]: string }
   })
@@ -204,11 +305,8 @@ async function createTerminalTask(input: CreateTaskInput): Promise<Task> {
   ptyMap.set(task.id, ptyProcess)
 
   ptyProcess.onData((data: string) => {
-    if (data.includes('__AGENTHOME_STOP__')) {
-      const target = tasks.find(t => t.id === task.id)
-      if (target && target.status === 'running') {
-        target.status = 'waiting_input'
-      }
+    if (data.includes('__AGENTHOME_STOP__') && task.status === 'running') {
+      task.status = 'waiting_input'
       appendInteraction(task.id, '[system] stop hook triggered, waiting for your input.\n')
       return
     }
@@ -219,14 +317,35 @@ async function createTerminalTask(input: CreateTaskInput): Promise<Task> {
     ptyMap.delete(task.id)
     stopStopWatcher(task.id)
     appendInteraction(task.id, `\n[system] process exited with code ${exitCode ?? -1}\n`)
-    const target = tasks.find(t => t.id === task.id)
-    if (target) {
-      target.status = 'completed'
-      target.exitCode = exitCode
-      target.finishedAt = Date.now()
-    }
+    task.status = exitCode === 0 ? 'completed' : 'interrupted'
+    task.exitCode = exitCode
+    task.finishedAt = Date.now()
   })
+}
 
+async function createTask(input: CreateTaskInput): Promise<Task> {
+  const baseCommand = AGENT_COMMAND_MAP[input.agent]
+  if (!baseCommand) throw new Error(`unknown agent: ${input.agent}`)
+
+  const computedName = input.name.trim() || `${input.agent} 任务`
+  const desc = input.description?.trim()
+  const fullCommand = desc ? `${baseCommand} ${shellSingleQuote(desc)}` : baseCommand
+  const task: Task = {
+    id: Date.now().toString(),
+    ...input,
+    name: computedName,
+    command: fullCommand,
+    interactions: [],
+    status: 'created',
+    runtimeMode: 'legacy',
+    runtimeReason: '新建任务，待启动',
+    runtimeEndpoint: ACP_ENDPOINT || '(未配置)',
+    createdAt: input.createdAt
+  }
+  tasks.push(task)
+  interactionBuffers.set(task.id, [])
+  appendInteraction(task.id, `[system] task created, waiting to start: ${fullCommand}\n`)
+  appendInteraction(task.id, `[system] cwd: ${input.workPath || process.cwd()}\n`)
   return task
 }
 
@@ -237,6 +356,12 @@ app.on('window-all-closed', () => {
     try { p.kill() } catch {}
   })
   ptyMap.clear()
+  if (acpSessionManager) {
+    acpSessionIdByTask.forEach((sessionId) => {
+      void acpSessionManager.cancel(sessionId).catch(() => {})
+    })
+  }
+  acpSessionIdByTask.clear()
   if (process.platform !== 'darwin') app.quit()
 })
 
@@ -244,20 +369,37 @@ app.on('activate', () => {
   if (mainWindow === null) createWindow()
 })
 
-ipcMain.handle('get-tasks', () => tasks)
-ipcMain.handle('create-task', async (_, input: CreateTaskInput) => createTerminalTask(input))
+ipcMain.handle('get-tasks', () => {
+  tasks.forEach(ensureTaskRuntimeReason)
+  return tasks
+})
+ipcMain.handle('create-task', async (_, input: CreateTaskInput) => createTask(input))
 
 ipcMain.handle('task-get-buffer', (_, taskId: string) => interactionBuffers.get(taskId) ?? [])
 
 ipcMain.handle('task-send-input', (_, taskId: string, data: string) => {
   const p = ptyMap.get(taskId)
-  if (!p) return { ok: false }
+  const acpSessionId = acpSessionIdByTask.get(taskId)
+  if (!p && !acpSessionId) return { ok: false }
   const target = tasks.find(t => t.id === taskId)
   if (target && target.status === 'waiting_input') {
     target.status = 'running'
     appendInteraction(taskId, '[system] user input received, status -> 运行中\n')
   }
-  p.write(data)
+  if (acpSessionId && acpSessionManager && target && data.trim()) {
+    void acpSessionManager.sendAndStream({
+      taskId,
+      command: AGENT_COMMAND_MAP[target.agent] ?? target.command,
+      cwd: target.workPath || process.cwd(),
+      prompt: data.trim()
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : 'send input failed'
+      appendInteraction(taskId, `[system] ACP send input failed: ${message}\n`)
+      const task = tasks.find(t => t.id === taskId)
+      if (task) task.lastError = message
+    })
+  }
+  if (p) p.write(data)
   return { ok: true }
 })
 
@@ -269,6 +411,11 @@ ipcMain.handle('resize-pty', (_, taskId: string, cols: number, rows: number) => 
 ipcMain.handle('kill-task', (_, taskId: string) => {
   const p = ptyMap.get(taskId)
   if (p) { p.kill(); ptyMap.delete(taskId) }
+  const sessionId = acpSessionIdByTask.get(taskId)
+  if (sessionId && acpSessionManager) {
+    void acpSessionManager.cancel(sessionId).catch(() => {})
+    acpSessionIdByTask.delete(taskId)
+  }
   stopStopWatcher(taskId)
   const target = tasks.find(t => t.id === taskId)
   if (target) { target.status = 'interrupted'; target.finishedAt = Date.now() }
@@ -276,11 +423,67 @@ ipcMain.handle('kill-task', (_, taskId: string) => {
 
 ipcMain.handle('update-task-status', (_, id, status) => {
   const target = tasks.find(t => t.id === id)
-  if (target) target.status = status
+  if (target) {
+    if (status === 'running') {
+      void startTaskExecution(target)
+    } else {
+      if (status === 'completed') {
+        if (target.runtimeMode === 'acp') {
+          target.status = 'waiting_input'
+          appendInteraction(target.id, '[system] manually moved to 完成任务, keep ACP alive, status -> 等待输入\n')
+        } else {
+          stopTaskExecution(target, 'manually moved to 完成任务')
+          target.status = 'completed'
+          target.finishedAt = Date.now()
+          if (target.exitCode === undefined) target.exitCode = 0
+        }
+      } else if (status === 'interrupted') {
+        stopTaskExecution(target, 'manually moved to 中断的任务')
+        target.status = 'interrupted'
+        target.finishedAt = Date.now()
+      } else {
+        target.status = status
+        if (status === 'created') {
+          stopTaskExecution(target, '任务已重置为待启动')
+          target.finishedAt = undefined
+          target.exitCode = undefined
+        }
+      }
+      if (status === 'created') {
+        target.runtimeReason = '任务已重置为待启动'
+      }
+    }
+  }
   return { id, status }
 })
 
 ipcMain.handle('get-project-path', () => process.cwd())
+ipcMain.handle('acp-send-and-stream', async (_, taskId: string, prompt: string) => {
+  const target = tasks.find(t => t.id === taskId)
+  if (!target || !acpSessionManager) return { ok: false }
+  const { sessionId } = await acpSessionManager.sendAndStream({
+    taskId,
+    command: AGENT_COMMAND_MAP[target.agent] ?? target.command,
+    cwd: target.workPath || process.cwd(),
+    prompt
+  })
+  acpSessionIdByTask.set(taskId, sessionId)
+  return { ok: true, sessionId }
+})
+ipcMain.handle('acp-cancel', async (_, sessionId: string) => {
+  if (!acpSessionManager) return { ok: false }
+  await acpSessionManager.cancel(sessionId)
+  return { ok: true }
+})
+ipcMain.handle('acp-respond-permission', async (_, sessionId: string, approved: boolean) => {
+  if (!acpSessionManager) return { ok: false }
+  await acpSessionManager.respondPermission(sessionId, approved)
+  return { ok: true }
+})
+ipcMain.handle('get-task-runtime-mode', (_, taskId: string) => {
+  const target = tasks.find(t => t.id === taskId)
+  return target?.runtimeMode ?? null
+})
 
 ipcMain.handle('select-directory', async () => {
   const result = await dialog.showOpenDialog({ properties: ['openDirectory'] })

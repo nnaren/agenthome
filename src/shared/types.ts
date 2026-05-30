@@ -14,6 +14,10 @@ export interface Task {
   startedAt?: number
   finishedAt?: number
   exitCode?: number | null
+  runtimeMode?: 'legacy' | 'acp'
+  lastError?: string
+  runtimeReason?: string
+  runtimeEndpoint?: string
 }
 
 export type CreateTaskInput = Omit<Task, 'id' | 'status' | 'startedAt' | 'finishedAt' | 'exitCode' | 'interactions' | 'command'>

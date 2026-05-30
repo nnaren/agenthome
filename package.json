@@ -5,6 +5,9 @@
   "main": "dist/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
+    "dev:acp-server": "node scripts/acp-server.mjs",
+    "dev:app-with-acp": "AGENTHOME_ENABLE_ACP=1 AGENTHOME_ACP_ENDPOINT=http://127.0.0.1:8787 electron-vite dev",
+    "dev:all-with-acp": "sh -c 'ACP_STARTED_BY_SCRIPT=0; if ! curl -fsS http://127.0.0.1:8787/healthz >/dev/null 2>&1; then node scripts/acp-server.mjs & ACP_PID=$!; ACP_STARTED_BY_SCRIPT=1; fi; AGENTHOME_ENABLE_ACP=1 AGENTHOME_ACP_ENDPOINT=http://127.0.0.1:8787 electron-vite dev; EXIT_CODE=$?; if [ \"$ACP_STARTED_BY_SCRIPT\" = \"1\" ]; then kill $ACP_PID 2>/dev/null; wait $ACP_PID 2>/dev/null; fi; exit $EXIT_CODE'",
     "build": "electron-vite build",
     "package": "electron-vite build && electron-builder --dir",
     "package:win": "electron-vite build && electron-builder --win --dir",
