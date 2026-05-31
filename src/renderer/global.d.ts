@@ -12,6 +12,8 @@ declare global {
       getTaskBuffer: (taskId: string) => Promise<string[]>
       getChatHistory: (taskId: string) => Promise<ChatMessageRecord[]>
       setChatHistory: (taskId: string, messages: ChatMessageRecord[]) => Promise<{ ok: boolean }>
+      getSessionSystemLog: (taskId: string) => Promise<string[]>
+      appendSessionSystemLog: (taskId: string, lines: string[]) => Promise<{ ok: boolean }>
       resizePty: (taskId: string, cols: number, rows: number) => Promise<void>
       killTask: (taskId: string) => Promise<void>
       onPtyData: (callback: (taskId: string, data: string) => void) => () => void

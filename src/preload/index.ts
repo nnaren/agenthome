@@ -11,6 +11,8 @@ export interface ElectronAPI {
   getTaskBuffer: (taskId: string) => Promise<string[]>
   getChatHistory: (taskId: string) => Promise<ChatMessageRecord[]>
   setChatHistory: (taskId: string, messages: ChatMessageRecord[]) => Promise<{ ok: boolean }>
+  getSessionSystemLog: (taskId: string) => Promise<string[]>
+  appendSessionSystemLog: (taskId: string, lines: string[]) => Promise<{ ok: boolean }>
   resizePty: (taskId: string, cols: number, rows: number) => Promise<void>
   killTask: (taskId: string) => Promise<void>
   onPtyData: (callback: (taskId: string, data: string) => void) => () => void
@@ -36,6 +38,8 @@ const api: ElectronAPI = {
   getTaskBuffer: (taskId) => ipcRenderer.invoke('task-get-buffer', taskId),
   getChatHistory: (taskId) => ipcRenderer.invoke('get-chat-history', taskId),
   setChatHistory: (taskId, messages) => ipcRenderer.invoke('set-chat-history', taskId, messages),
+  getSessionSystemLog: (taskId) => ipcRenderer.invoke('get-session-system-log', taskId),
+  appendSessionSystemLog: (taskId, lines) => ipcRenderer.invoke('append-session-system-log', taskId, lines),
   resizePty: (taskId, cols, rows) => ipcRenderer.invoke('resize-pty', taskId, cols, rows),
   killTask: (taskId) => ipcRenderer.invoke('kill-task', taskId),
   onPtyData: (callback) => {

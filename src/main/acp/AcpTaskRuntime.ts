@@ -14,7 +14,7 @@ export class AcpTaskBusyError extends Error {
 }
 
 export class AcpTaskRuntime {
-  private readonly agentManager = new AcpAgentManager()
+  private readonly agentManager: AcpAgentManager
   private readonly clientBridge = new AcpClientBridge()
   private readonly connectionManager: AcpConnectionManager
   private sessionId: string | null = null
@@ -24,11 +24,14 @@ export class AcpTaskRuntime {
   private promptEpoch = 0
   private cancelRequested = false
   private firstEventTimeout: NodeJS.Timeout | null = null
+  private lastCwd: string | null = null
 
   constructor(
     readonly taskId: string,
+    agentCommand: string,
     private readonly emit: (event: AcpFrontendEvent) => void
   ) {
+    this.agentManager = new AcpAgentManager(agentCommand)
     this.connectionManager = new AcpConnectionManager(this.agentManager, this.clientBridge)
     this.connectionManager.setAgentStderrHandler((message) => {
       this.emit({
@@ -63,6 +66,10 @@ export class AcpTaskRuntime {
 
   getSessionId(): string | null {
     return this.sessionId
+  }
+
+  getAgentDiagnostics(): string {
+    return this.connectionManager.getAgentStderr()
   }
 
   setPersistedSessionId(sessionId: string | null | undefined): void {
@@ -109,7 +116,7 @@ export class AcpTaskRuntime {
   private async warmRestartAgent(): Promise<void> {
     try {
       this.connectionManager.reset()
-      await this.connectionManager.initialize()
+      await this.connectionManager.initialize(this.lastCwd ?? undefined)
     } catch {
       // 下次 sendPrompt 再试
     }
@@ -171,12 +178,13 @@ export class AcpTaskRuntime {
     return /connection closed|not ready|ECONNRESET|EPIPE|broken pipe/i.test(message)
   }
 
-  private async ensureConnection(): Promise<ReturnType<AcpConnectionManager['getConnection']>> {
+  private async ensureConnection(cwd: string): Promise<ReturnType<AcpConnectionManager['getConnection']>> {
+    this.lastCwd = cwd
     if (!this.agentManager.isChildAlive()) {
       this.connectionManager.reset()
       this.sessionStale = true
     }
-    await this.connectionManager.initialize()
+    await this.connectionManager.initialize(cwd)
     return this.connectionManager.getConnection()
   }
 
@@ -194,25 +202,31 @@ export class AcpTaskRuntime {
     cwd: string,
     sessionId: string
   ): Promise<boolean> {
+    this.clientBridge.bindSession(sessionId, this.taskId)
+    this.clientBridge.suppressSessionReplay(sessionId)
     try {
-      await connection.resumeSession({ sessionId, cwd, mcpServers: [] })
-      this.bindSession(sessionId)
-      return true
-    } catch {
-      // try loadSession next
-    }
-    try {
+      try {
+        await connection.resumeSession({ sessionId, cwd, mcpServers: [] })
+        this.bindSession(sessionId)
+        return true
+      } catch {
+        // Hermes / Claude: resume 失败时尝试 load（会话仍在 ~/.hermes/state.db 或 agent 存储中）
+      }
       await connection.loadSession({ sessionId, cwd, mcpServers: [] })
       this.bindSession(sessionId)
       return true
     } catch {
+      this.clientBridge.unbindSession(sessionId)
       return false
+    } finally {
+      this.clientBridge.releaseSessionReplay(sessionId)
     }
   }
 
   private async ensureSession(
     connection: ReturnType<AcpConnectionManager['getConnection']>,
-    cwd: string
+    cwd: string,
+    options: { createIfMissing: boolean }
   ): Promise<void> {
     if (this.sessionId && !this.sessionStale) return
 
@@ -228,6 +242,13 @@ export class AcpTaskRuntime {
         this.sessionId = null
       }
       this.persistedSessionId = null
+      if (!options.createIfMissing) {
+        throw new Error(`ACP session not found or expired: ${candidateId}`)
+      }
+    }
+
+    if (!options.createIfMissing) {
+      throw new Error('ACP session was not resumed')
     }
 
     const previous = this.sessionId
@@ -257,8 +278,8 @@ export class AcpTaskRuntime {
   /** 恢复已持久化的 session，不发送 prompt */
   async resumePersistedSession(cwd: string, sessionId: string): Promise<{ sessionId: string }> {
     this.persistedSessionId = sessionId
-    const connection = await this.ensureConnection()
-    await this.ensureSession(connection, cwd)
+    const connection = await this.ensureConnection(cwd)
+    await this.ensureSession(connection, cwd, { createIfMissing: false })
     if (!this.sessionId) throw new Error('ACP session was not resumed')
     return { sessionId: this.sessionId }
   }
@@ -269,8 +290,8 @@ export class AcpTaskRuntime {
     this.cancelRequested = false
     this.busy = true
     try {
-      const connection = await this.ensureConnection()
-      await this.ensureSession(connection, cwd)
+      const connection = await this.ensureConnection(cwd)
+      await this.ensureSession(connection, cwd, { createIfMissing: true })
       await this.runPrompt(connection, prompt, turnEpoch)
       if (!this.sessionId) throw new Error('ACP session was not created')
       return { sessionId: this.sessionId }

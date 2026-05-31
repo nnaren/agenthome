@@ -4,6 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AgentHome</title>
+    <script>
+      (function () {
+        var theme = localStorage.getItem('agenthome-theme')
+        document.documentElement.dataset.theme =
+          theme === 'light' || theme === 'dark' || theme === 'system' ? theme : 'system'
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

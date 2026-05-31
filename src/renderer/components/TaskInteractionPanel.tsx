@@ -174,6 +174,7 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
     const next = [...prev, ...stamped]
     const trimmed = next.length > SYSTEM_LOG_MAX ? next.slice(-SYSTEM_LOG_MAX) : next
     systemLogsByTaskRef.current.set(taskId, trimmed)
+    void window.electronAPI.appendSessionSystemLog(taskId, stamped)
     if (taskId === activeTaskIdRef.current) {
       setSystemLogs(trimmed)
     }
@@ -456,7 +457,7 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
         setAcpBusyByTask((prev) => ({ ...prev, [task.id]: busy }))
       }
     })
-    if (task.runtimeMode === 'acp') {
+    if (task.runtimeMode === 'acp' || (task.acpSessionId && (task.agent === 'hermes-agent' || task.agent === 'claude-code'))) {
       void window.electronAPI.getAcpSessionId(task.id).then(({ sessionId }) => {
         if (!cancelled && sessionId) setTaskSessionId(task.id, sessionId)
       })
@@ -475,15 +476,22 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
       const buffer = await window.electronAPI.getTaskBuffer(task.id)
       if (cancelled) return
       const joined = buffer.join('')
+      const persistedLogs = await window.electronAPI.getSessionSystemLog(task.id)
+      if (cancelled) return
       const cachedLogs = systemLogsByTaskRef.current.get(task.id) ?? []
-      const seenBodies = new Set(cachedLogs.map(logLineBody))
-      const newFromBuffer = extractBackendMessages(joined)
-        .filter((line) => !seenBodies.has(line))
-        .map((line) => stampLogLine(line))
-      const mergedLogs =
-        cachedLogs.length > 0 || newFromBuffer.length > 0
-          ? [...cachedLogs, ...newFromBuffer]
-          : []
+      const mergedLogs: string[] = []
+      const seenBodies = new Set<string>()
+      for (const line of [...persistedLogs, ...cachedLogs]) {
+        const body = logLineBody(line)
+        if (seenBodies.has(body)) continue
+        seenBodies.add(body)
+        mergedLogs.push(line)
+      }
+      for (const line of extractBackendMessages(joined)) {
+        if (seenBodies.has(line)) continue
+        seenBodies.add(line)
+        mergedLogs.push(stampLogLine(line))
+      }
       const trimmedLogs =
         mergedLogs.length > SYSTEM_LOG_MAX
           ? mergedLogs.slice(-SYSTEM_LOG_MAX)

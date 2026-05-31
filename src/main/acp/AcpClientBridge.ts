@@ -23,6 +23,19 @@ export class AcpClientBridge implements Client {
   private readonly emitter = new EventEmitter()
   private readonly sessionToTask = new Map<string, string>()
   private readonly pendingPermissions = new Map<string, PendingPermission>()
+  private readonly replaySuppressedSessions = new Set<string>()
+
+  suppressSessionReplay(sessionId: string): void {
+    this.replaySuppressedSessions.add(sessionId)
+  }
+
+  releaseSessionReplay(sessionId: string): void {
+    this.replaySuppressedSessions.delete(sessionId)
+  }
+
+  isSessionReplaySuppressed(sessionId: string): boolean {
+    return this.replaySuppressedSessions.has(sessionId)
+  }
 
   onEvent(handler: (event: AcpFrontendEvent) => void): () => void {
     this.emitter.on('event', handler)
@@ -62,6 +75,7 @@ export class AcpClientBridge implements Client {
   }
 
   async sessionUpdate(params: SessionNotification): Promise<void> {
+    if (this.replaySuppressedSessions.has(params.sessionId)) return
     const taskId = this.sessionToTask.get(params.sessionId)
     if (!taskId) return
     const update = params.update

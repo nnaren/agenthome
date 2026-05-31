@@ -1,11 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { buildSpawnEnv, shellInvoke } from '../shellEnv'
 
 export class AcpAgentManager {
   private started = false
   private child: ChildProcessWithoutNullStreams | null = null
   private onExitHandler: (() => void) | null = null
-  private readonly command = process.env.AGENTHOME_ACP_AGENT_COMMAND?.trim()
-    || 'npx --yes @agentclientprotocol/claude-agent-acp@latest --acp'
+  private lastStderr = ''
+  private spawnCwd = process.cwd()
+
+  constructor(private readonly command: string) {}
 
   setOnExit(handler: () => void): void {
     this.onExitHandler = handler
@@ -15,27 +18,38 @@ export class AcpAgentManager {
     return this.child != null && this.child.exitCode === null && !this.child.killed
   }
 
-  async startIfNeeded(): Promise<void> {
+  async startIfNeeded(cwd?: string): Promise<void> {
+    if (cwd) this.spawnCwd = cwd
     if (this.isChildAlive()) return
     this.child = null
     this.started = false
+    this.lastStderr = ''
 
-    const shell = process.platform === 'win32' ? 'powershell.exe' : 'zsh'
-    const shellArgs = process.platform === 'win32'
-      ? ['-Command', this.command]
-      : ['-c', this.command]
-    this.child = spawn(shell, shellArgs, {
-      cwd: process.cwd(),
-      env: { ...process.env, TERM: 'xterm-256color' },
+    const { shell, args } = shellInvoke(this.command)
+    this.child = spawn(shell, args, {
+      cwd: this.spawnCwd,
+      env: buildSpawnEnv(),
       stdio: 'pipe'
     })
     this.started = true
 
-    this.child.on('exit', () => {
+    this.child.stderr.on('data', (chunk: Buffer | string) => {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8')
+      this.lastStderr = `${this.lastStderr}${text}`.slice(-4000)
+    })
+
+    this.child.on('exit', (code) => {
+      if (code !== 0 && code !== null && !this.lastStderr) {
+        this.lastStderr = `ACP agent exited with code ${code}`
+      }
       this.child = null
       this.started = false
       this.onExitHandler?.()
     })
+  }
+
+  getLastStderr(): string {
+    return this.lastStderr.trim()
   }
 
   isStarted(): boolean {

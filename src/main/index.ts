@@ -6,7 +6,13 @@ import { mkdir, readFile, writeFile } from 'fs/promises'
 import type { ChatMessageRecord } from '../shared/chat'
 import type { CreateTaskInput, Task } from '../shared/types'
 import { AcpRuntimeRegistry } from './acp/AcpRuntimeRegistry'
-import { AcpTaskBusyError } from './acp/AcpTaskRuntime'
+import { AcpTaskBusyError, type AcpTaskRuntime } from './acp/AcpTaskRuntime'
+import {
+  getAcpAgentCommand,
+  isAcpEligibleAgent,
+  isAcpFeatureEnabled,
+  isAcpRegistryAllowed
+} from './acp/agentConfig'
 import {
   ensureDataDir,
   loadAllChatHistories,
@@ -14,6 +20,14 @@ import {
   saveChatToDisk,
   saveTasksToDisk
 } from './persistence/store'
+import {
+  appendSessionSystemLogs,
+  bindTaskSessionLogFile,
+  extractSystemLogBodies,
+  loadSessionSystemLog,
+  resolveSessionLogFile
+} from './persistence/sessionLog'
+import { buildSpawnEnv, resolveCommandBinary, shellInvoke } from './shellEnv'
 
 log.info('AgentHome starting...')
 
@@ -31,10 +45,9 @@ const hookEventOffsets = new Map<string, number>()
 const AGENT_COMMAND_MAP: Record<string, string> = {
   'claude-code': 'claude',
   'flow-cli': 'flow',
-  'hermes-agent': 'hermes'
+  'hermes-agent': 'hermes chat --accept-hooks'
 }
 
-const ACP_ENABLE = process.env.AGENTHOME_ENABLE_ACP === '1'
 const ACP_ENDPOINT = process.env.AGENTHOME_ACP_ENDPOINT ?? ''
 /** 默认自动批准 ACP 工具权限；设 AGENTHOME_ACP_AUTO_APPROVE=0 改为 UI 手动确认 */
 const ACP_AUTO_APPROVE_PERMISSION = process.env.AGENTHOME_ACP_AUTO_APPROVE !== '0'
@@ -92,6 +105,7 @@ async function loadPersistedState(): Promise<void> {
     interactionBuffers.set(task.id, [])
     if (task.acpSessionId) {
       acpSessionIdByTask.set(task.id, task.acpSessionId)
+      resolveSessionLogFile(task)
     }
   }
   const chats = await loadAllChatHistories()
@@ -102,9 +116,29 @@ async function loadPersistedState(): Promise<void> {
 }
 
 function getAcpUnavailableReason(agent: string): string {
-  if (agent !== 'claude-code') return '当前任务类型不是 claude-code，默认使用终端模式'
-  if (!ACP_ENABLE) return '未开启 AGENTHOME_ENABLE_ACP=1，使用终端模式'
+  const typed = agent as Task['agent']
+  if (!isAcpEligibleAgent(typed)) {
+    return `${agent} 不支持 ACP，默认使用终端模式`
+  }
+  if (!isAcpFeatureEnabled(typed)) {
+    if (typed === 'claude-code') return '未开启 AGENTHOME_ENABLE_ACP=1，使用终端模式'
+    return 'ACP 已禁用（AGENTHOME_ENABLE_ACP=0）'
+  }
   return 'ACP agent 协议不可用，已回退到终端模式'
+}
+
+function buildLegacyCommand(agent: Task['agent'], description?: string): string {
+  let base = AGENT_COMMAND_MAP[agent]
+  if (!base) throw new Error(`unknown agent: ${agent}`)
+  if (agent === 'hermes-agent') {
+    base = resolveCommandBinary(base, 'hermes')
+  }
+  const desc = description?.trim()
+  if (!desc) return base
+  if (agent === 'hermes-agent') {
+    return `${base} -q ${shellSingleQuote(desc)}`
+  }
+  return `${base} ${shellSingleQuote(desc)}`
 }
 
 function ensureTaskRuntimeReason(task: Task): void {
@@ -155,10 +189,7 @@ async function ensureClaudeHooks(cwd: string): Promise<void> {
   const claudeDir = join(cwd, '.claude')
   const payload = `${JSON.stringify(CLAUDE_HOOKS_CONFIG, null, 2)}\n`
   await mkdir(claudeDir, { recursive: true })
-  await Promise.all([
-    writeFile(join(claudeDir, 'settings.json'), payload, 'utf-8'),
-    writeFile(join(claudeDir, 'settings.local.json'), payload, 'utf-8')
-  ])
+  await writeFile(join(claudeDir, 'settings.json'), payload, 'utf-8')
 }
 
 function createWindow(): void {
@@ -221,18 +252,27 @@ function openTaskCreateWindow(): void {
   })
 }
 
+function persistSystemLogsFromText(taskId: string, text: string): void {
+  const target = tasks.find((t) => t.id === taskId)
+  if (!target) return
+  const bodies = extractSystemLogBodies(text)
+  if (bodies.length === 0) return
+  void appendSessionSystemLogs(target, bodies)
+}
+
 function appendInteraction(taskId: string, text: string): void {
   const lines = interactionBuffers.get(taskId) ?? []
   lines.push(text)
   if (lines.length > 1000) lines.splice(0, lines.length - 1000)
   interactionBuffers.set(taskId, lines)
+  persistSystemLogsFromText(taskId, text)
   const target = tasks.find(t => t.id === taskId)
   if (target?.runtimeMode === 'acp') return
   mainWindow?.webContents.send('pty-data', taskId, text)
 }
 
 function ensureAcpRegistry(): AcpRuntimeRegistry | null {
-  if (!ACP_ENABLE) return null
+  if (!isAcpRegistryAllowed()) return null
   if (!acpRegistry) {
     acpRegistry = new AcpRuntimeRegistry((event) => {
       mainWindow?.webContents.send('acp-session-update', event)
@@ -346,13 +386,16 @@ function stopTaskExecution(task: Task, reason: string): void {
 function setTaskAcpSessionId(task: Task, sessionId: string): void {
   task.acpSessionId = sessionId
   acpSessionIdByTask.set(task.id, sessionId)
+  void bindTaskSessionLogFile(task, sessionId)
   schedulePersistTasks()
 }
 
 function prepareAcpRuntime(task: Task): AcpTaskRuntime {
   const registry = ensureAcpRegistry()
   if (!registry) throw new Error('ACP registry unavailable')
-  const runtime = registry.getOrCreate(task.id)
+  const runtime = registry.getOrCreate(task.id, {
+    agentCommand: getAcpAgentCommand(task.agent)
+  })
   runtime.setPersistedSessionId(task.acpSessionId)
   return runtime
 }
@@ -360,6 +403,8 @@ function prepareAcpRuntime(task: Task): AcpTaskRuntime {
 async function tryStartAcpSession(task: Task, cwd: string): Promise<boolean> {
   const registry = ensureAcpRegistry()
   if (!registry) return false
+  const acpCommand = getAcpAgentCommand(task.agent)
+  appendInteraction(task.id, `[system] trying ACP: ${acpCommand}\n`)
   try {
     const runtime = prepareAcpRuntime(task)
     if (task.acpSessionId) {
@@ -385,7 +430,10 @@ async function tryStartAcpSession(task: Task, cwd: string): Promise<boolean> {
     schedulePersistTasks()
     return true
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'ACP start failed'
+    const base = error instanceof Error ? error.message : 'ACP start failed'
+    const runtimeRef = registry.get(task.id)
+    const stderr = runtimeRef?.getAgentDiagnostics() ?? ''
+    const message = stderr && !base.includes(stderr) ? `${base} | ${stderr}` : base
     task.lastError = message
     task.runtimeMode = 'legacy'
     task.runtimeReason = `ACP 启动失败，已回退终端模式: ${message}`
@@ -421,17 +469,18 @@ async function startTaskExecution(task: Task): Promise<void> {
   task.runtimeEndpoint = ACP_ENDPOINT || '(未配置)'
   schedulePersistTasks()
 
-  if (task.agent === 'claude-code') {
+  if (isAcpEligibleAgent(task.agent) && isAcpFeatureEnabled(task.agent)) {
     const acpReady = await tryStartAcpSession(task, cwd)
     if (!acpReady) {
       task.runtimeMode = 'legacy'
       if (!task.runtimeReason) task.runtimeReason = getAcpUnavailableReason(task.agent)
     }
+  } else if (isAcpEligibleAgent(task.agent)) {
+    appendInteraction(task.id, `[system] ACP skipped: ${getAcpUnavailableReason(task.agent)}\n`)
   }
   if (task.agent === 'claude-code' && task.runtimeMode !== 'acp') {
     await ensureClaudeHooks(cwd)
     appendInteraction(task.id, `[system] hooks written: ${join(cwd, '.claude', 'settings.json')}\n`)
-    appendInteraction(task.id, `[system] hooks written: ${join(cwd, '.claude', 'settings.local.json')}\n`)
     startStopWatcher(task.id, cwd)
   }
   if (task.runtimeMode === 'acp') {
@@ -441,10 +490,10 @@ async function startTaskExecution(task: Task): Promise<void> {
   }
   appendInteraction(task.id, `[system] terminal started: ${task.command}\n`)
   appendInteraction(task.id, `[system] cwd: ${cwd}\n`)
-  const shell = process.platform === 'win32' ? 'powershell.exe' : 'zsh'
-  const ptyProcess = pty.spawn(shell, ['-c', task.command], {
+  const { shell, args } = shellInvoke(task.command)
+  const ptyProcess = pty.spawn(shell, args, {
     cwd,
-    env: { ...process.env, TERM: 'xterm-256color' } as { [key: string]: string }
+    env: buildSpawnEnv() as { [key: string]: string }
   })
 
   ptyMap.set(task.id, ptyProcess)
@@ -471,12 +520,10 @@ async function startTaskExecution(task: Task): Promise<void> {
 }
 
 async function createTask(input: CreateTaskInput): Promise<Task> {
-  const baseCommand = AGENT_COMMAND_MAP[input.agent]
-  if (!baseCommand) throw new Error(`unknown agent: ${input.agent}`)
+  if (!AGENT_COMMAND_MAP[input.agent]) throw new Error(`unknown agent: ${input.agent}`)
 
   const computedName = input.name.trim() || `${input.agent} 任务`
-  const desc = input.description?.trim()
-  const fullCommand = desc ? `${baseCommand} ${shellSingleQuote(desc)}` : baseCommand
+  const fullCommand = buildLegacyCommand(input.agent, input.description)
   const task: Task = {
     id: Date.now().toString(),
     ...input,
@@ -536,6 +583,19 @@ ipcMain.handle('create-task', async (_, input: CreateTaskInput) => createTask(in
 ipcMain.handle('task-get-buffer', (_, taskId: string) => interactionBuffers.get(taskId) ?? [])
 
 ipcMain.handle('get-chat-history', (_, taskId: string) => chatHistories.get(taskId) ?? [])
+
+ipcMain.handle('get-session-system-log', async (_, taskId: string) => {
+  const target = tasks.find((t) => t.id === taskId)
+  if (!target) return []
+  return loadSessionSystemLog(target)
+})
+
+ipcMain.handle('append-session-system-log', async (_, taskId: string, lines: string[]) => {
+  const target = tasks.find((t) => t.id === taskId)
+  if (!target || !Array.isArray(lines) || lines.length === 0) return { ok: true }
+  await appendSessionSystemLogs(target, lines)
+  return { ok: true }
+})
 
 ipcMain.handle('set-chat-history', (_, taskId: string, messages: ChatMessageRecord[]) => {
   chatHistories.set(taskId, messages)
@@ -630,6 +690,10 @@ ipcMain.handle('acp-send-and-stream', async (_, taskId: string, prompt: string) 
   const target = tasks.find(t => t.id === taskId)
   const registry = ensureAcpRegistry()
   if (!target || !registry) return { ok: false }
+  if (target.acpSessionId && target.runtimeMode !== 'acp' && isAcpEligibleAgent(target.agent)) {
+    target.runtimeMode = 'acp'
+    schedulePersistTasks()
+  }
   try {
     const runtime = prepareAcpRuntime(target)
     const { sessionId } = await runtime.sendPrompt(target.workPath || process.cwd(), prompt)
@@ -678,7 +742,13 @@ ipcMain.handle('acp-resume-session', async (_, taskId: string) => {
   const target = tasks.find(t => t.id === taskId)
   const registry = ensureAcpRegistry()
   if (!target || !registry || !target.acpSessionId) return { ok: false, reason: 'no_session' }
-  if (target.runtimeMode !== 'acp') return { ok: false, reason: 'not_acp' }
+  if (!isAcpEligibleAgent(target.agent) || !isAcpFeatureEnabled(target.agent)) {
+    return { ok: false, reason: 'not_acp' }
+  }
+  if (target.runtimeMode !== 'acp') {
+    target.runtimeMode = 'acp'
+    schedulePersistTasks()
+  }
   try {
     const runtime = prepareAcpRuntime(target)
     const cwd = target.workPath || process.cwd()

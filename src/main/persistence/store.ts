@@ -26,10 +26,18 @@ export async function ensureDataDir(): Promise<void> {
 }
 
 function normalizeLoadedTask(task: Task): Task {
+  let next = task
   if (task.status === 'running') {
-    return { ...task, status: 'waiting_input' }
+    next = { ...next, status: 'waiting_input' }
   }
-  return task
+  if (task.acpSessionId?.trim()) {
+    next = {
+      ...next,
+      runtimeMode: 'acp',
+      runtimeReason: next.runtimeReason ?? 'ACP 会话已保存，打开任务后自动恢复'
+    }
+  }
+  return next
 }
 
 export async function loadTasksFromDisk(): Promise<Task[]> {

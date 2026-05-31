@@ -2,7 +2,8 @@ import { Readable, Writable } from 'node:stream'
 import {
   ClientSideConnection,
   ndJsonStream,
-  PROTOCOL_VERSION
+  PROTOCOL_VERSION,
+  type InitializeResponse
 } from '@agentclientprotocol/sdk'
 import { AcpAgentManager } from './AcpAgentManager'
 import { AcpClientBridge } from './AcpClientBridge'
@@ -11,6 +12,7 @@ export class AcpConnectionManager {
   private connection: ClientSideConnection | null = null
   private initPromise: Promise<void> | null = null
   private onAgentStderr: ((message: string) => void) | null = null
+  private pendingCwd: string | null = null
   constructor(
     private readonly agentManager: AcpAgentManager,
     private readonly clientBridge: AcpClientBridge
@@ -29,7 +31,8 @@ export class AcpConnectionManager {
     this.initPromise = null
   }
 
-  async initialize(): Promise<void> {
+  async initialize(cwd?: string): Promise<void> {
+    if (cwd) this.pendingCwd = cwd
     if (this.connection && this.agentManager.isChildAlive()) return
     if (this.initPromise && this.agentManager.isChildAlive()) return this.initPromise
     this.reset()
@@ -52,10 +55,34 @@ export class AcpConnectionManager {
     return this.agentManager.getCommand()
   }
 
+  getAgentStderr(): string {
+    return this.agentManager.getLastStderr()
+  }
+
+  private async authenticateIfNeeded(init: InitializeResponse): Promise<void> {
+    const methods = init.authMethods ?? []
+    if (methods.length === 0 || !this.connection) return
+    const preferred =
+      methods.find((method) => method.id !== 'hermes-setup')
+      ?? methods[0]
+    try {
+      await this.connection.authenticate({ methodId: preferred.id })
+    } catch {
+      // 部分 agent 在未显式 authenticate 时也能用已配置的 runtime 凭证
+    }
+  }
+
   private async doInitialize(): Promise<void> {
-    await this.agentManager.startIfNeeded()
+    await this.agentManager.startIfNeeded(this.pendingCwd ?? undefined)
     const child = this.agentManager.getChildProcess()
-    if (!child) throw new Error('ACP agent process not started')
+    if (!child) {
+      const detail = this.agentManager.getLastStderr()
+      throw new Error(
+        detail
+          ? `ACP agent process not started: ${detail}`
+          : `ACP agent process not started (command: ${this.agentManager.getCommand()})`
+      )
+    }
 
     child.stderr.on('data', (chunk: Buffer | string) => {
       const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8')
@@ -69,7 +96,7 @@ export class AcpConnectionManager {
     const stream = ndJsonStream(input, output)
     this.connection = new ClientSideConnection(() => this.clientBridge, stream)
 
-    await this.connection.initialize({
+    const init = await this.connection.initialize({
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: {
         fs: {
@@ -82,5 +109,6 @@ export class AcpConnectionManager {
         version: '0.1.0'
       }
     })
+    await this.authenticateIfNeeded(init)
   }
 }

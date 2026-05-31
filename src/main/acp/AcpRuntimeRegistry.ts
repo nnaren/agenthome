@@ -1,15 +1,23 @@
 import { AcpTaskRuntime } from './AcpTaskRuntime'
 import type { AcpFrontendEvent } from './types'
 
+export interface AcpRuntimeOptions {
+  agentCommand: string
+}
+
 export class AcpRuntimeRegistry {
   private readonly runtimes = new Map<string, AcpTaskRuntime>()
 
   constructor(private readonly emit: (event: AcpFrontendEvent) => void) {}
 
-  getOrCreate(taskId: string): AcpTaskRuntime {
+  getOrCreate(taskId: string, options: AcpRuntimeOptions): AcpTaskRuntime {
     let runtime = this.runtimes.get(taskId)
     if (!runtime) {
-      runtime = new AcpTaskRuntime(taskId, (event) => this.emit(event))
+      runtime = new AcpTaskRuntime(
+        taskId,
+        options.agentCommand,
+        (event) => this.emit(event)
+      )
       this.runtimes.set(taskId, runtime)
     }
     return runtime

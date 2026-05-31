@@ -17,7 +17,7 @@ interface TaskCardProps {
 function TaskCard({ task, onSelect, selected }: TaskCardProps) {
   return (
     <div
-      className={`task-card ${selected ? 'task-card-selected' : ''}`}
+      className={`task-card task-card-agent-${task.agent}${selected ? ' task-card-selected' : ''}`}
       onClick={() => onSelect(task.id)}
       draggable
       onDragStart={(e) => {
@@ -25,8 +25,12 @@ function TaskCard({ task, onSelect, selected }: TaskCardProps) {
         e.dataTransfer.effectAllowed = 'move'
       }}
     >
+      {task.description ? (
+        <div className="task-desc">{task.description}</div>
+      ) : (
+        <div className="task-desc task-desc-empty">无描述</div>
+      )}
       <div className="task-name">{task.name || '(未命名任务)'}</div>
-      {task.description && <div className="task-desc">{task.description}</div>}
       <div className="task-meta">Agent: {task.agent}</div>
       <div className="task-meta">路径: {task.workPath}</div>
       <div className="task-meta">命令: {task.command}</div>
