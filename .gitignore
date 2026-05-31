@@ -4,3 +4,4 @@ release/
 .env
 *.log
 .DS_Store
+.agenthome_hook_events
