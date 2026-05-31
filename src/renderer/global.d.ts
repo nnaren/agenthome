@@ -25,6 +25,7 @@ declare global {
       acpCancelByTask: (taskId: string) => Promise<{ ok: boolean }>
       getAcpTaskBusy: (taskId: string) => Promise<{ busy: boolean }>
       getAcpSessionId: (taskId: string) => Promise<{ sessionId: string | null }>
+      acpResumeSession: (taskId: string) => Promise<{ ok: boolean; sessionId?: string; reason?: string }>
       onAcpSessionUpdate: (callback: (event: AcpFrontendEvent) => void) => () => void
     }
   }

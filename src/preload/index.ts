@@ -24,6 +24,7 @@ export interface ElectronAPI {
   acpCancelByTask: (taskId: string) => Promise<{ ok: boolean }>
   getAcpTaskBusy: (taskId: string) => Promise<{ busy: boolean }>
   getAcpSessionId: (taskId: string) => Promise<{ sessionId: string | null }>
+  acpResumeSession: (taskId: string) => Promise<{ ok: boolean; sessionId?: string; reason?: string }>
   onAcpSessionUpdate: (callback: (event: AcpFrontendEvent) => void) => () => void
 }
 
@@ -52,6 +53,7 @@ const api: ElectronAPI = {
   acpCancelByTask: (taskId) => ipcRenderer.invoke('acp-cancel-by-task', taskId),
   getAcpTaskBusy: (taskId) => ipcRenderer.invoke('get-acp-task-busy', taskId),
   getAcpSessionId: (taskId) => ipcRenderer.invoke('get-acp-session-id', taskId),
+  acpResumeSession: (taskId) => ipcRenderer.invoke('acp-resume-session', taskId),
   onAcpSessionUpdate: (callback) => {
     const handler = (_: Electron.IpcRendererEvent, event: AcpFrontendEvent) => callback(event)
     ipcRenderer.on('acp-session-update', handler)

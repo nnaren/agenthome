@@ -18,6 +18,7 @@ export class AcpTaskRuntime {
   private readonly clientBridge = new AcpClientBridge()
   private readonly connectionManager: AcpConnectionManager
   private sessionId: string | null = null
+  private persistedSessionId: string | null = null
   private sessionStale = false
   private busy = false
   private promptEpoch = 0
@@ -62,6 +63,10 @@ export class AcpTaskRuntime {
 
   getSessionId(): string | null {
     return this.sessionId
+  }
+
+  setPersistedSessionId(sessionId: string | null | undefined): void {
+    this.persistedSessionId = sessionId?.trim() ? sessionId.trim() : null
   }
 
   respondPermission(approved: boolean): void {
@@ -175,21 +180,65 @@ export class AcpTaskRuntime {
     return this.connectionManager.getConnection()
   }
 
+  private bindSession(sessionId: string): void {
+    if (this.sessionId && this.sessionId !== sessionId) {
+      this.clientBridge.unbindSession(this.sessionId)
+    }
+    this.sessionId = sessionId
+    this.clientBridge.bindSession(sessionId, this.taskId)
+    this.sessionStale = false
+  }
+
+  private async tryAttachSession(
+    connection: ReturnType<AcpConnectionManager['getConnection']>,
+    cwd: string,
+    sessionId: string
+  ): Promise<boolean> {
+    try {
+      await connection.resumeSession({ sessionId, cwd, mcpServers: [] })
+      this.bindSession(sessionId)
+      return true
+    } catch {
+      // try loadSession next
+    }
+    try {
+      await connection.loadSession({ sessionId, cwd, mcpServers: [] })
+      this.bindSession(sessionId)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   private async ensureSession(
     connection: ReturnType<AcpConnectionManager['getConnection']>,
     cwd: string
   ): Promise<void> {
     if (this.sessionId && !this.sessionStale) return
 
+    const candidateId = this.sessionId ?? this.persistedSessionId
+    if (candidateId) {
+      const attached = await this.tryAttachSession(connection, cwd, candidateId)
+      if (attached) {
+        this.persistedSessionId = null
+        return
+      }
+      if (this.sessionId === candidateId) {
+        this.clientBridge.unbindSession(this.sessionId)
+        this.sessionId = null
+      }
+      this.persistedSessionId = null
+    }
+
     const previous = this.sessionId
     const sessionResult = await connection.newSession({ cwd, mcpServers: [] })
-    this.sessionId = sessionResult.sessionId
+    this.bindSession(sessionResult.sessionId)
     if (previous && previous !== this.sessionId) {
       this.clientBridge.unbindSession(previous)
     }
-    this.clientBridge.bindSession(this.sessionId, this.taskId)
-    this.sessionStale = false
+  }
 
+  private startFirstEventTimeout(): void {
     if (this.firstEventTimeout) {
       clearTimeout(this.firstEventTimeout)
       this.firstEventTimeout = null
@@ -203,6 +252,15 @@ export class AcpTaskRuntime {
       })
       void this.cancelCurrentTurn()
     }, FIRST_EVENT_TIMEOUT_MS)
+  }
+
+  /** 恢复已持久化的 session，不发送 prompt */
+  async resumePersistedSession(cwd: string, sessionId: string): Promise<{ sessionId: string }> {
+    this.persistedSessionId = sessionId
+    const connection = await this.ensureConnection()
+    await this.ensureSession(connection, cwd)
+    if (!this.sessionId) throw new Error('ACP session was not resumed')
+    return { sessionId: this.sessionId }
   }
 
   async sendPrompt(cwd: string, prompt: string): Promise<{ sessionId: string }> {
@@ -230,6 +288,7 @@ export class AcpTaskRuntime {
   ): Promise<void> {
     if (!this.sessionId) return
     const sessionId = this.sessionId
+    this.startFirstEventTimeout()
     try {
       const result = await Promise.race([
         connection.prompt({

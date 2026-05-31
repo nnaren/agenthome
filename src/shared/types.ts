@@ -15,6 +15,8 @@ export interface Task {
   finishedAt?: number
   exitCode?: number | null
   runtimeMode?: 'legacy' | 'acp'
+  /** ACP 会话 ID，持久化后用于 resumeSession 恢复上下文 */
+  acpSessionId?: string | null
   lastError?: string
   runtimeReason?: string
   runtimeEndpoint?: string

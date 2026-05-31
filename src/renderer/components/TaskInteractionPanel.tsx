@@ -75,6 +75,8 @@ function serializeMessages(messages: ChatMessage[]): ChatMessageRecord[] {
 /** 任务启动时用 description 补用户气泡（创建/拖入运行时尚未走交互区发送） */
 const SYSTEM_LOG_MAX = 2000
 const CHUNK_LOG_MARKER = '[acp] chunk output: '
+const INPUT_MIN_HEIGHT_PX = 36
+const INPUT_MAX_HEIGHT_PX = 200
 
 function formatLogTimestamp(date = new Date()): string {
   const pad = (n: number, width = 2): string => String(n).padStart(width, '0')
@@ -115,10 +117,12 @@ function withUserBubble(msgs: ChatMessage[], currentTask: Task): ChatMessage[] {
 
 function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteractionPanelProps) {
   const messageListRef = useRef<HTMLDivElement>(null)
+  const suppressMessageAutoScrollRef = useRef(false)
   const messagesByTaskRef = useRef<Map<string, ChatMessage[]>>(new Map())
   const messagesRef = useRef<ChatMessage[]>([])
   const activeTaskIdRef = useRef<string | undefined>()
   const [input, setInput] = useState('')
+  const inputRef = useRef<HTMLTextAreaElement>(null)
   const [systemLogs, setSystemLogs] = useState<string[]>([])
   const systemLogsByTaskRef = useRef<Map<string, string[]>>(new Map())
   const systemLogRef = useRef<HTMLDivElement>(null)
@@ -141,6 +145,21 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
   }, [])
   const isAcpBusy = task ? (acpBusyByTask[task.id] ?? false) : false
   const isWaitingPermission = Boolean(acpPermission)
+
+  const adjustInputHeight = useCallback(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    const next = Math.min(
+      INPUT_MAX_HEIGHT_PX,
+      Math.max(INPUT_MIN_HEIGHT_PX, el.scrollHeight)
+    )
+    el.style.height = `${next}px`
+  }, [])
+
+  useEffect(() => {
+    adjustInputHeight()
+  }, [input, adjustInputHeight])
 
   const persistChatHistory = useCallback((taskId: string, next: ChatMessage[]) => {
     const serialized = serializeMessages(next)
@@ -394,6 +413,7 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
   }
 
   const toggleThoughtExpanded = (messageId: string, thoughtIndex: number): void => {
+    suppressMessageAutoScrollRef.current = true
     setMessages((prev) => prev.map((msg) => {
       if (msg.id !== messageId) return msg
       const thoughts = getThoughtList(msg)
@@ -423,7 +443,11 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
     }
     activeTaskIdRef.current = task.id
     setAcpPermission(acpPermissionByTaskRef.current.get(task.id) ?? null)
-    setAcpSessionId(acpSessionIdByTaskRef.current.get(task.id) ?? null)
+    if (task.acpSessionId) {
+      setTaskSessionId(task.id, task.acpSessionId)
+    } else {
+      setAcpSessionId(acpSessionIdByTaskRef.current.get(task.id) ?? null)
+    }
 
     let cancelled = false
 
@@ -436,6 +460,16 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
       void window.electronAPI.getAcpSessionId(task.id).then(({ sessionId }) => {
         if (!cancelled && sessionId) setTaskSessionId(task.id, sessionId)
       })
+      if (task.acpSessionId) {
+        void window.electronAPI.acpResumeSession(task.id).then((result) => {
+          if (cancelled) return
+          if (result.ok && result.sessionId) {
+            setTaskSessionId(task.id, result.sessionId)
+          } else if (result.reason) {
+            appendSystemLogsForTask(task.id, [`[system] ACP resume: ${result.reason}`])
+          }
+        })
+      }
     }
     const load = async (): Promise<void> => {
       const buffer = await window.electronAPI.getTaskBuffer(task.id)
@@ -519,7 +553,7 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
 
     void load()
     return () => { cancelled = true }
-  }, [task?.id, task?.status, task?.description, collapsed])
+  }, [task?.id, task?.status, task?.description, task?.runtimeMode, task?.acpSessionId, collapsed, appendSystemLogsForTask, persistChatHistory])
 
   useEffect(() => {
     if (!task?.id || collapsed || messages.length === 0) return
@@ -629,9 +663,12 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
   }, [systemLogs])
 
   useEffect(() => {
-    if (messageListRef.current) {
-      messageListRef.current.scrollTop = messageListRef.current.scrollHeight
+    if (!messageListRef.current) return
+    if (suppressMessageAutoScrollRef.current) {
+      suppressMessageAutoScrollRef.current = false
+      return
     }
+    messageListRef.current.scrollTop = messageListRef.current.scrollHeight
   }, [messages])
 
   const handleSend = async () => {
@@ -665,6 +702,7 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
         await window.electronAPI.sendTaskInput(task.id, `${text}\n`)
       }
       setInput('')
+      requestAnimationFrame(adjustInputHeight)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       appendSystemLogsForTask(task.id, [`[acp] send failed: ${message}`])
@@ -834,14 +872,16 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
                 </div>
               )}
               <div className="interaction-input-row">
-                <input
+                <textarea
+                  ref={inputRef}
                   className="form-input interaction-input"
+                  rows={1}
                   placeholder={
                     isWaitingPermission && task.runtimeMode === 'acp'
                       ? '请先批准或拒绝上方的工具权限请求'
                       : isAcpBusy && task.runtimeMode === 'acp'
                         ? 'ACP 正在处理上一条消息...'
-                        : '输入内容后回车或点击发送'
+                        : '输入内容，Enter 发送，Shift+Enter 换行'
                   }
                   value={input}
                   disabled={
@@ -849,13 +889,13 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
                   }
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
+                    if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault()
                       void handleSend()
                     }
                   }}
                 />
-                {(isAcpBusy || isWaitingPermission) && task.runtimeMode === 'acp' && (
+                {(isAcpBusy || isWaitingPermission) && task.runtimeMode === 'acp' ? (
                   <button
                     type="button"
                     className="btn-primary"
@@ -864,20 +904,14 @@ function TaskInteractionPanel({ task, collapsed, width, onToggle }: TaskInteract
                   >
                     停止 (Esc)
                   </button>
+                ) : (
+                  <button
+                    className="btn-primary"
+                    onClick={() => void handleSend()}
+                  >
+                    发送
+                  </button>
                 )}
-                <button
-                  className="btn-primary"
-                  onClick={() => void handleSend()}
-                  disabled={
-                    task.runtimeMode === 'acp' && (isAcpBusy || isWaitingPermission)
-                  }
-                >
-                  {isWaitingPermission && task.runtimeMode === 'acp'
-                    ? '等待批准'
-                    : isAcpBusy && task.runtimeMode === 'acp'
-                      ? '处理中...'
-                      : '发送'}
-                </button>
               </div>
             </>
           )}

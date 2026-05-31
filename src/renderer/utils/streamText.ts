@@ -83,13 +83,14 @@ export function countClosedThinkBlocks(text: string): number {
   return (text.match(/<\/(?:redacted_)?think(?:ing)?>/gi) ?? []).length
 }
 
-/** 展示正文：<br> 转 \n；连续换行（含 \\n\\n）合并为单个 \\n，不留空行 */
+/** 展示正文：<br> 转 \n；连续换行合并；去掉末尾空行，避免占满最后一行 */
 export function prepareMessageForDisplay(text: string): string {
   if (!text) return ''
   return text
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/\r\n/g, '\n')
     .replace(/\n{2,}/g, '\n')
+    .replace(/\n+$/, '')
     .trimEnd()
 }
 

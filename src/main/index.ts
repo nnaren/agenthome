@@ -7,6 +7,13 @@ import type { ChatMessageRecord } from '../shared/chat'
 import type { CreateTaskInput, Task } from '../shared/types'
 import { AcpRuntimeRegistry } from './acp/AcpRuntimeRegistry'
 import { AcpTaskBusyError } from './acp/AcpTaskRuntime'
+import {
+  ensureDataDir,
+  loadAllChatHistories,
+  loadTasksFromDisk,
+  saveChatToDisk,
+  saveTasksToDisk
+} from './persistence/store'
 
 log.info('AgentHome starting...')
 
@@ -33,6 +40,67 @@ const ACP_ENDPOINT = process.env.AGENTHOME_ACP_ENDPOINT ?? ''
 const ACP_AUTO_APPROVE_PERMISSION = process.env.AGENTHOME_ACP_AUTO_APPROVE !== '0'
 let acpRegistry: AcpRuntimeRegistry | null = null
 
+let persistTasksTimer: NodeJS.Timeout | null = null
+const chatPersistTimers = new Map<string, NodeJS.Timeout>()
+let isFlushingPersistence = false
+
+function schedulePersistTasks(): void {
+  if (persistTasksTimer) clearTimeout(persistTasksTimer)
+  persistTasksTimer = setTimeout(() => {
+    persistTasksTimer = null
+    void saveTasksToDisk(tasks).catch((error) => {
+      log.error('[persistence] save tasks failed', error)
+    })
+  }, 300)
+}
+
+function schedulePersistChat(taskId: string, messages: ChatMessageRecord[]): void {
+  const existing = chatPersistTimers.get(taskId)
+  if (existing) clearTimeout(existing)
+  chatPersistTimers.set(
+    taskId,
+    setTimeout(() => {
+      chatPersistTimers.delete(taskId)
+      void saveChatToDisk(taskId, messages).catch((error) => {
+        log.error(`[persistence] save chat failed for ${taskId}`, error)
+      })
+    }, 500)
+  )
+}
+
+async function flushPersistence(): Promise<void> {
+  if (persistTasksTimer) {
+    clearTimeout(persistTasksTimer)
+    persistTasksTimer = null
+  }
+  for (const [taskId, timer] of chatPersistTimers) {
+    clearTimeout(timer)
+    chatPersistTimers.delete(taskId)
+    const messages = chatHistories.get(taskId)
+    if (messages) {
+      await saveChatToDisk(taskId, messages)
+    }
+  }
+  await saveTasksToDisk(tasks)
+}
+
+async function loadPersistedState(): Promise<void> {
+  await ensureDataDir()
+  const loadedTasks = await loadTasksFromDisk()
+  tasks.push(...loadedTasks)
+  for (const task of loadedTasks) {
+    interactionBuffers.set(task.id, [])
+    if (task.acpSessionId) {
+      acpSessionIdByTask.set(task.id, task.acpSessionId)
+    }
+  }
+  const chats = await loadAllChatHistories()
+  for (const [taskId, messages] of chats) {
+    chatHistories.set(taskId, messages)
+  }
+  log.info(`[persistence] loaded ${loadedTasks.length} tasks, ${chats.size} chat histories`)
+}
+
 function getAcpUnavailableReason(agent: string): string {
   if (agent !== 'claude-code') return '当前任务类型不是 claude-code，默认使用终端模式'
   if (!ACP_ENABLE) return '未开启 AGENTHOME_ENABLE_ACP=1，使用终端模式'
@@ -41,7 +109,11 @@ function getAcpUnavailableReason(agent: string): string {
 
 function ensureTaskRuntimeReason(task: Task): void {
   if (task.runtimeMode === 'acp') {
-    if (!task.runtimeReason) task.runtimeReason = '已连接 ACP 会话'
+    if (!task.runtimeReason) {
+      task.runtimeReason = task.acpSessionId
+        ? 'ACP 会话已保存，打开任务后自动恢复'
+        : '已连接 ACP 会话'
+    }
     return
   }
   if (!task.runtimeMode) task.runtimeMode = 'legacy'
@@ -168,6 +240,7 @@ function ensureAcpRegistry(): AcpRuntimeRegistry | null {
       if (!target) return
       if (event.type === 'sessionUpdate') {
         target.status = 'running'
+        schedulePersistTasks()
         if (event.chunkKind !== 'thought') {
           appendInteraction(event.taskId, event.chunk ?? '')
         }
@@ -175,10 +248,12 @@ function ensureAcpRegistry(): AcpRuntimeRegistry | null {
       }
       if (event.type === 'toolCall' || event.type === 'toolCallUpdate') {
         target.status = 'running'
+        schedulePersistTasks()
         return
       }
       if (event.type === 'permissionRequest') {
         target.status = 'waiting_input'
+        schedulePersistTasks()
         appendInteraction(
           event.taskId,
           `[system] ACP permission/input requested: ${event.message ?? 'permission required'}\n`
@@ -187,6 +262,7 @@ function ensureAcpRegistry(): AcpRuntimeRegistry | null {
           acpRegistry?.getBySessionId(event.sessionId)?.respondPermission(true)
           appendInteraction(event.taskId, '[system] ACP permission auto-approved\n')
           target.status = 'running'
+          schedulePersistTasks()
         }
         return
       }
@@ -196,6 +272,7 @@ function ensureAcpRegistry(): AcpRuntimeRegistry | null {
         target.status = code === 0 || cancelled ? 'waiting_input' : 'interrupted'
         target.exitCode = event.exitCode ?? null
         if (code !== 0 && !cancelled) target.finishedAt = Date.now()
+        schedulePersistTasks()
         appendInteraction(
           event.taskId,
           cancelled
@@ -207,6 +284,7 @@ function ensureAcpRegistry(): AcpRuntimeRegistry | null {
       if (event.type === 'sessionError') {
         target.lastError = event.message ?? 'ACP session error'
         target.status = 'waiting_input'
+        schedulePersistTasks()
         appendInteraction(event.taskId, `[system] ACP session error: ${event.message ?? 'unknown'}\n`)
       }
     })
@@ -230,6 +308,7 @@ function startStopWatcher(taskId: string, cwd: string): void {
       if (!target) return
       if (target.status === 'running') {
         target.status = 'waiting_input'
+        schedulePersistTasks()
       }
       appendInteraction(taskId, '[system] stop hook detected, status -> 等待输入\n')
     } catch {
@@ -264,21 +343,46 @@ function stopTaskExecution(task: Task, reason: string): void {
   appendInteraction(task.id, `[system] ${reason}\n`)
 }
 
+function setTaskAcpSessionId(task: Task, sessionId: string): void {
+  task.acpSessionId = sessionId
+  acpSessionIdByTask.set(task.id, sessionId)
+  schedulePersistTasks()
+}
+
+function prepareAcpRuntime(task: Task): AcpTaskRuntime {
+  const registry = ensureAcpRegistry()
+  if (!registry) throw new Error('ACP registry unavailable')
+  const runtime = registry.getOrCreate(task.id)
+  runtime.setPersistedSessionId(task.acpSessionId)
+  return runtime
+}
+
 async function tryStartAcpSession(task: Task, cwd: string): Promise<boolean> {
   const registry = ensureAcpRegistry()
   if (!registry) return false
   try {
+    const runtime = prepareAcpRuntime(task)
+    if (task.acpSessionId) {
+      const { sessionId } = await runtime.resumePersistedSession(cwd, task.acpSessionId)
+      setTaskAcpSessionId(task, sessionId)
+      task.runtimeMode = 'acp'
+      task.lastError = undefined
+      task.runtimeReason = '已恢复 ACP 会话'
+      appendInteraction(task.id, `[system] ACP session resumed: ${sessionId}\n`)
+      schedulePersistTasks()
+      return true
+    }
     const initialPrompt = task.description?.trim()
-    const runtime = registry.getOrCreate(task.id)
     const { sessionId } = await runtime.sendPrompt(
       cwd,
       initialPrompt || '请先进行任务分析并给出第一步执行建议。'
     )
-    acpSessionIdByTask.set(task.id, sessionId)
+    setTaskAcpSessionId(task, sessionId)
     task.runtimeMode = 'acp'
     task.lastError = undefined
     task.runtimeReason = '已连接 ACP 会话'
-    appendInteraction(task.id, '[system] ACP session started.\n')
+    appendInteraction(task.id, `[system] ACP session started: ${sessionId}\n`)
+    schedulePersistTasks()
     return true
   } catch (error) {
     const message = error instanceof Error ? error.message : 'ACP start failed'
@@ -286,6 +390,7 @@ async function tryStartAcpSession(task: Task, cwd: string): Promise<boolean> {
     task.runtimeMode = 'legacy'
     task.runtimeReason = `ACP 启动失败，已回退终端模式: ${message}`
     appendInteraction(task.id, `[system] ACP unavailable, fallback to legacy: ${message}\n`)
+    schedulePersistTasks()
     return false
   }
 }
@@ -299,6 +404,7 @@ function seedChatUserMessage(task: Task): void {
     { id: `user-init-${task.id}`, role: 'user', content: desc },
     ...existing
   ])
+  schedulePersistChat(task.id, chatHistories.get(task.id) ?? [])
 }
 
 async function startTaskExecution(task: Task): Promise<void> {
@@ -313,6 +419,7 @@ async function startTaskExecution(task: Task): Promise<void> {
   task.runtimeMode = 'legacy'
   task.runtimeReason = getAcpUnavailableReason(task.agent)
   task.runtimeEndpoint = ACP_ENDPOINT || '(未配置)'
+  schedulePersistTasks()
 
   if (task.agent === 'claude-code') {
     const acpReady = await tryStartAcpSession(task, cwd)
@@ -345,6 +452,7 @@ async function startTaskExecution(task: Task): Promise<void> {
   ptyProcess.onData((data: string) => {
     if (data.includes('__AGENTHOME_STOP__') && task.status === 'running') {
       task.status = 'waiting_input'
+      schedulePersistTasks()
       appendInteraction(task.id, '[system] stop hook triggered, waiting for your input.\n')
       return
     }
@@ -358,6 +466,7 @@ async function startTaskExecution(task: Task): Promise<void> {
     task.status = exitCode === 0 ? 'completed' : 'interrupted'
     task.exitCode = exitCode
     task.finishedAt = Date.now()
+    schedulePersistTasks()
   })
 }
 
@@ -384,10 +493,23 @@ async function createTask(input: CreateTaskInput): Promise<Task> {
   interactionBuffers.set(task.id, [])
   appendInteraction(task.id, `[system] task created, waiting to start: ${fullCommand}\n`)
   appendInteraction(task.id, `[system] cwd: ${input.workPath || process.cwd()}\n`)
+  schedulePersistTasks()
   return task
 }
 
-app.whenReady().then(createWindow)
+app.whenReady().then(async () => {
+  await loadPersistedState()
+  createWindow()
+})
+
+app.on('before-quit', (event) => {
+  if (isFlushingPersistence) return
+  event.preventDefault()
+  isFlushingPersistence = true
+  void flushPersistence()
+    .catch((error) => log.error('[persistence] flush on quit failed', error))
+    .finally(() => app.quit())
+})
 
 app.on('window-all-closed', () => {
   ptyMap.forEach((p) => {
@@ -417,23 +539,24 @@ ipcMain.handle('get-chat-history', (_, taskId: string) => chatHistories.get(task
 
 ipcMain.handle('set-chat-history', (_, taskId: string, messages: ChatMessageRecord[]) => {
   chatHistories.set(taskId, messages)
+  schedulePersistChat(taskId, messages)
   return { ok: true }
 })
 
 ipcMain.handle('task-send-input', (_, taskId: string, data: string) => {
   const p = ptyMap.get(taskId)
-  const acpSessionId = acpSessionIdByTask.get(taskId)
-  if (!p && !acpSessionId) return { ok: false }
   const target = tasks.find(t => t.id === taskId)
+  if (!p && target?.runtimeMode !== 'acp') return { ok: false }
   if (target && target.status === 'waiting_input') {
     target.status = 'running'
+    schedulePersistTasks()
     appendInteraction(taskId, '[system] user input received, status -> 运行中\n')
   }
   const registry = ensureAcpRegistry()
   if (registry && target?.runtimeMode === 'acp' && data.trim()) {
-    const runtime = registry.getOrCreate(taskId)
+    const runtime = prepareAcpRuntime(target)
     void runtime.sendPrompt(target.workPath || process.cwd(), data.trim()).then(({ sessionId }) => {
-      acpSessionIdByTask.set(taskId, sessionId)
+      setTaskAcpSessionId(target, sessionId)
     }).catch((error) => {
       const message = error instanceof Error ? error.message : 'send input failed'
       appendInteraction(taskId, `[system] ACP send input failed: ${message}\n`)
@@ -460,7 +583,7 @@ ipcMain.handle('kill-task', (_, taskId: string) => {
   }
   stopStopWatcher(taskId)
   const target = tasks.find(t => t.id === taskId)
-  if (target) { target.status = 'interrupted'; target.finishedAt = Date.now() }
+  if (target) { target.status = 'interrupted'; target.finishedAt = Date.now(); schedulePersistTasks() }
 })
 
 ipcMain.handle('update-task-status', async (_, id, status) => {
@@ -489,12 +612,15 @@ ipcMain.handle('update-task-status', async (_, id, status) => {
           stopTaskExecution(target, '任务已重置为待启动')
           target.finishedAt = undefined
           target.exitCode = undefined
+          target.acpSessionId = undefined
+          acpSessionIdByTask.delete(target.id)
         }
       }
       if (status === 'created') {
         target.runtimeReason = '任务已重置为待启动'
       }
     }
+    schedulePersistTasks()
   }
   return { id, status }
 })
@@ -505,9 +631,9 @@ ipcMain.handle('acp-send-and-stream', async (_, taskId: string, prompt: string) 
   const registry = ensureAcpRegistry()
   if (!target || !registry) return { ok: false }
   try {
-    const runtime = registry.getOrCreate(taskId)
+    const runtime = prepareAcpRuntime(target)
     const { sessionId } = await runtime.sendPrompt(target.workPath || process.cwd(), prompt)
-    acpSessionIdByTask.set(taskId, sessionId)
+    setTaskAcpSessionId(target, sessionId)
     return { ok: true, sessionId }
   } catch (error) {
     if (error instanceof AcpTaskBusyError) {
@@ -542,9 +668,31 @@ ipcMain.handle('get-acp-task-busy', (_, taskId: string) => {
 ipcMain.handle('get-acp-session-id', (_, taskId: string) => {
   const fromMap = acpSessionIdByTask.get(taskId) ?? null
   if (fromMap) return { sessionId: fromMap }
+  const target = tasks.find(t => t.id === taskId)
+  if (target?.acpSessionId) return { sessionId: target.acpSessionId }
   const registry = ensureAcpRegistry()
   const runtimeId = registry?.get(taskId)?.getSessionId() ?? null
   return { sessionId: runtimeId }
+})
+ipcMain.handle('acp-resume-session', async (_, taskId: string) => {
+  const target = tasks.find(t => t.id === taskId)
+  const registry = ensureAcpRegistry()
+  if (!target || !registry || !target.acpSessionId) return { ok: false, reason: 'no_session' }
+  if (target.runtimeMode !== 'acp') return { ok: false, reason: 'not_acp' }
+  try {
+    const runtime = prepareAcpRuntime(target)
+    const cwd = target.workPath || process.cwd()
+    const { sessionId } = await runtime.resumePersistedSession(cwd, target.acpSessionId)
+    setTaskAcpSessionId(target, sessionId)
+    target.runtimeReason = '已恢复 ACP 会话'
+    appendInteraction(taskId, `[system] ACP session resumed: ${sessionId}\n`)
+    return { ok: true, sessionId }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'resume failed'
+    target.lastError = message
+    appendInteraction(taskId, `[system] ACP resume failed: ${message}\n`)
+    return { ok: false, reason: message }
+  }
 })
 ipcMain.handle('get-task-runtime-mode', (_, taskId: string) => {
   const target = tasks.find(t => t.id === taskId)

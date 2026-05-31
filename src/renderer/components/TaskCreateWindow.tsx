@@ -43,16 +43,16 @@ function TaskCreateWindow() {
       <div className="task-form task-form-window">
         <input
           className="form-input"
-          placeholder="任务名称（可选）"
-          value={name}
-          onChange={e => setName(e.target.value)}
+          placeholder="任务描述（必填）"
+          value={description}
+          onChange={e => setDescription(e.target.value)}
           autoFocus
         />
         <input
           className="form-input"
-          placeholder="任务描述（必填）"
-          value={description}
-          onChange={e => setDescription(e.target.value)}
+          placeholder="任务名称（可选）"
+          value={name}
+          onChange={e => setName(e.target.value)}
         />
         <select className="form-input form-select-window" value={agent} onChange={e => setAgent(e.target.value as AgentType)}>
           {AGENT_OPTIONS.map(option => (
